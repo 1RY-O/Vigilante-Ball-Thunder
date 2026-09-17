@@ -1,0 +1,46 @@
+import { describe, expect, it, vi } from 'vitest'
+import { artifactUrl, capabilities, friendlyError, getMusicXML, parseJob, upload, validateFile } from './api'
+const caps = { formats: ['mp3', 'wav', 'flac'], maxUploadBytes: 1024 * 1024 }
+describe('recording validation', () => {
+  it.each(['mp3', 'WAV', 'flac'])('accepts supported %s files', extension => { expect(validateFile(new File(['sound'], `melody.${extension}`), caps)).toBeNull() })
+  it('rejects empty, unsupported, and oversized files', () => {
+    expect(validateFile(new File([], 'empty.mp3'), caps)).toMatch(/empty/)
+    expect(validateFile(new File(['x'], 'song.exe'), caps)).toMatch(/Choose a/)
+    expect(validateFile(new File([new Uint8Array(caps.maxUploadBytes + 1)], 'long.wav'), caps)).toMatch(/too large/)
+  })
+})
+describe('API boundary', () => {
+  it('uses only formats confirmed by the service', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ ...caps, formats: ['wav', 'ogg'] })))
+    expect((await capabilities()).formats).toEqual(['wav'])
+  })
+  it('does not expose server errors or internal paths', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('secret /srv/private traceback', { status: 500 })))
+    await expect(capabilities()).rejects.toThrow('service is unavailable')
+    expect(friendlyError(new Error('secret'))).not.toContain('secret')
+  })
+  it('validates complete results and optional progress', () => {
+    expect(parseJob({ id: '1', status: 'transcribing', progress: 25 })).toEqual({ id: '1', status: 'transcribing', progress: 25 })
+    expect(parseJob({ id: '1', status: 'queued', progress: 200 }).progress).toBeUndefined()
+    expect(parseJob({ id: '1', status: 'complete', result: { musicxmlUrl: '/api/files/score', midiUrl: '/api/files/midi' } }).result?.musicxmlUrl).toContain('/api/files/score')
+    expect(() => parseJob({ id: '1', status: 'complete' })).toThrow()
+    expect(() => parseJob({ id: '1', status: 'invented' })).toThrow()
+  })
+  it.each(['https://example.com/secret', 'javascript:alert(1)', '/api/../../secret', '//evil.test/a'])('rejects unsafe artifact URL %s', url => { expect(() => artifactUrl(url)).toThrow() })
+  it('rejects malformed notation', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('<html>not music</html>')))
+    await expect(getMusicXML('/api/score', new AbortController().signal)).rejects.toThrow('not valid MusicXML')
+  })
+  it('sends multipart audio and reports actual upload progress', async () => {
+    const xhr = { open: vi.fn(), upload: {} as { onprogress: (e: object) => void }, send: vi.fn(), abort: vi.fn(), status: 202, responseText: '{"id":"1","status":"queued"}', onload: () => {}, onloadend: () => {} }
+    vi.stubGlobal('XMLHttpRequest', class { constructor() { return xhr } })
+    const progress = vi.fn()
+    const promise = upload(new File(['audio'], 'song.wav'), new AbortController().signal, progress)
+    expect(xhr.open).toHaveBeenCalledWith('POST', '/api/transcriptions')
+    expect(xhr.send.mock.calls[0][0].get('file').name).toBe('song.wav')
+    xhr.upload.onprogress({ lengthComputable: true, loaded: 5, total: 10 })
+    expect(progress).toHaveBeenCalledWith(50)
+    xhr.onload(); xhr.onloadend()
+    await expect(promise).resolves.toEqual({ id: '1', status: 'queued' })
+  })
+})

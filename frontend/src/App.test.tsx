@@ -1,0 +1,46 @@
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { it, expect, vi } from 'vitest'
+import App from './App'
+import Playback from './Playback'
+it('keeps uploads disabled when the backend is unavailable', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('internal path')))
+  render(<App />)
+  expect(await screen.findByText('Transcription isn’t connected yet')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Choose a recording' })).toBeDisabled()
+  expect(screen.queryByText('Transcribing your recording')).not.toBeInTheDocument()
+})
+it('validates dropped files and selects a recording without uploading', async () => {
+  const fetch = vi.fn().mockResolvedValue(Response.json({ formats: ['mp3', 'wav', 'flac'], maxUploadBytes: 1024 * 1024 }))
+  vi.stubGlobal('fetch', fetch)
+  vi.stubGlobal('URL', Object.assign(URL, { createObjectURL: vi.fn(() => 'blob:recording'), revokeObjectURL: vi.fn() }))
+  render(<App />)
+  const input = screen.getByLabelText('Choose audio recording')
+  await waitFor(() => expect(input).toBeEnabled())
+  fireEvent.change(input, { target: { files: [new File(['x'], 'bad.txt')] } })
+  expect(screen.getByRole('alert')).toHaveTextContent('Choose a MP3, WAV, FLAC')
+  fireEvent.drop(screen.getByText('Let your music begin here').parentElement!, { dataTransfer: { files: [new File(['audio'], 'melody.wav')] } })
+  expect(screen.getByText('Recording selected')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Create sheet music' })).toBeEnabled()
+  expect(fetch).toHaveBeenCalledTimes(1)
+})
+it('reflects audio play/pause, seeking, restart and volume events', async () => {
+  vi.spyOn(HTMLMediaElement.prototype, 'play').mockImplementation(function(this: HTMLMediaElement) { this.dispatchEvent(new Event('play')); return Promise.resolve() })
+  vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(function(this: HTMLMediaElement) { this.dispatchEvent(new Event('pause')) })
+  const { container } = render(<Playback src="/api/audio" generated />)
+  const audio = container.querySelector('audio')!
+  Object.defineProperty(audio, 'duration', { value: 90 })
+  fireEvent.loadedMetadata(audio)
+  fireEvent.click(screen.getByRole('button', { name: 'Play' }))
+  await screen.findByRole('button', { name: 'Pause' })
+  fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+  expect(screen.getByRole('button', { name: 'Play' })).toBeInTheDocument()
+  fireEvent.change(screen.getByLabelText('Playback position'), { target: { value: '30' } })
+  expect(audio.currentTime).toBe(30)
+  expect(screen.getByLabelText('Current position')).toHaveTextContent('0:30 / 1:30')
+  fireEvent.change(screen.getByLabelText('Volume'), { target: { value: '0.3' } })
+  expect(audio.volume).toBe(0.3)
+  fireEvent.click(screen.getByRole('button', { name: 'Restart' }))
+  expect(audio.currentTime).toBe(0)
+  fireEvent.error(audio)
+  expect(screen.getByRole('alert')).toHaveTextContent('cannot be played')
+})
