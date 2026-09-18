@@ -1,0 +1,9 @@
+# MuScriptor worker dependencies (install into backend/.venv):
+#   python3 -m venv backend/.venv
+#   backend/.venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   backend/.venv/bin/pip install -r backend/python/requirements.txt
+#
+# torch is installed separately (CPU wheel above) to avoid pulling the large
+# CUDA wheel set from PyPI. muscriptor itself needs torch>=2.
+muscriptor==0.3.0
+music21>=9.3
