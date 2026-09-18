@@ -25,6 +25,14 @@ export interface EngineResult {
   model: string;
 }
 
+/**
+ * Availability code emitted when the background `--self-check` did not finish
+ * within its budget. On a CPU-only machine this means "still warming up"
+ * (torch import + gated-weight probe), NOT "broken" — callers must branch on
+ * this code rather than on message text.
+ */
+export const SELF_CHECK_TIMEOUT_CODE = 'self-check-timeout';
+
 /** Honest availability status surfaced verbatim in GET /api/capabilities. */
 export interface EngineAvailability {
   ok: boolean;

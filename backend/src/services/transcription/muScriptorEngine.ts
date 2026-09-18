@@ -7,6 +7,7 @@ import {
   EngineUnavailableError,
   MIDI_FILENAME,
   MUSICXML_FILENAME,
+  SELF_CHECK_TIMEOUT_CODE,
   TranscriptionError,
   CancelledError,
 } from './engine.js';
@@ -223,14 +224,15 @@ export class MuScriptorEngine implements TranscriptionEngine {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: this.baseEnv,
       });
-      // Hung self-checks (e.g. slow torch import on 8GB laptops) must not hang
-      // capabilities/POST: kill and report honestly as unavailable.
+      // A hung self-check (slow torch import on an 8GB laptop) is killed and
+      // reported with a dedicated code, so callers can tell "still warming up"
+      // apart from a real blocker (missing token/deps/license).
       const timer = setTimeout(() => {
         child.kill('SIGKILL');
         finish({
           ok: false,
-          code: 'engine-unavailable',
-          reason: 'MuScriptor availability check timed out. The worker did not respond in time.',
+          code: SELF_CHECK_TIMEOUT_CODE,
+          reason: `MuScriptor did not finish its availability check within ${Math.round(this.selfCheckTimeoutMs / 1000)}s.`,
         });
       }, this.selfCheckTimeoutMs);
       timer.unref();

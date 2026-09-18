@@ -1,5 +1,27 @@
 import { buildContext } from './appContext.js';
+import type { AppContext } from './appContext.js';
 import { createApp } from './app.js';
+import { SELF_CHECK_TIMEOUT_CODE } from './services/transcription/engine.js';
+import type { EngineAvailability } from './services/transcription/engine.js';
+
+/**
+ * Honest startup wording, branched on the machine-readable code (never on
+ * message text): a cold-start timeout means "warming up, will retry" while
+ * every other code is a real blocker that stays unavailable.
+ */
+function logEngineAvailability(ctx: AppContext, a: EngineAvailability): void {
+  if (a.ok) {
+    console.log('MuScriptor engine: ready (deps installed, HF access verified).');
+    return;
+  }
+  if (a.code === SELF_CHECK_TIMEOUT_CODE) {
+    console.warn(
+      `MuScriptor engine warming up (first check exceeded ${Math.round(ctx.config.selfCheckTimeoutMs / 1000)}s — will retry in background)`,
+    );
+    return;
+  }
+  console.warn(`MuScriptor engine NOT available: ${a.code ?? 'unknown'} — ${a.reason ?? 'no reason given'}`);
+}
 
 async function main(): Promise<void> {
   const ctx = await buildContext();
@@ -15,13 +37,16 @@ async function main(): Promise<void> {
       return;
     }
     console.log(`Transcription engine: ${ctx.engine.name} (model: ${model})`);
+    // Non-blocking: the first check imports torch and probes the gated
+    // weights (45-60s on a CPU-only cold start), so startup must never wait.
     void ctx.engine
       .available()
-      .then((a) => {
-        if (a.ok) console.log('MuScriptor engine: ready (deps installed, HF access verified).');
-        else console.warn(`MuScriptor engine NOT available: ${a.reason ?? a.code ?? 'unknown reason'}`);
-      })
-      .catch(() => console.warn('MuScriptor engine availability check failed.'));
+      .then((a) => logEngineAvailability(ctx, a))
+      .catch((e: unknown) =>
+        console.warn(
+          `MuScriptor engine availability check failed: ${e instanceof Error ? e.message : 'unknown error'}`,
+        ),
+      );
   });
 
   // engine name kept in closure for the shutdown log only
