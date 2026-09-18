@@ -120,6 +120,28 @@ describe('AvailabilityMonitor warm-up (no HTTP)', () => {
       monitor.stop();
     }
   });
+
+  it('stops polling AND stops lazy re-probes once available (no idle subprocess churn)', async () => {
+    const engine = new CountingEngine([{ ok: true }]);
+    const monitor = new AvailabilityMonitor(engine, 250);
+    monitor.start();
+    try {
+      await waitForCondition(async () => monitor.snapshot().value?.ok === true);
+      const callsWhenReady = engine.calls;
+
+      // A live run showed 'available: true' arriving together with
+      // 'checking: true' because capabilities traffic kept kicking off fresh
+      // probes; both must stay put while the engine is warm.
+      await sleep(900); // > 3 poll intervals, timer must already be gone
+      monitor.snapshot();
+      monitor.snapshot();
+      await sleep(150);
+      expect(engine.calls).toBe(callsWhenReady);
+      expect(monitor.snapshot().checking).toBe(false);
+    } finally {
+      monitor.stop();
+    }
+  });
 });
 
 describe('cold start over HTTP (real engine class + FAKE worker)', () => {

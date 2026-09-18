@@ -34,7 +34,6 @@ export class AvailabilityMonitor {
   private readonly pollIntervalMs: number;
   private readonly listeners = new Set<(availability: EngineAvailability) => void>();
   private value: EngineAvailability | null = null;
-  private checkedAt = 0;
   private inFlight: Promise<EngineAvailability> | null = null;
   private timer: NodeJS.Timeout | undefined;
   private stopped = false;
@@ -45,33 +44,48 @@ export class AvailabilityMonitor {
   }
 
   /**
-   * Last known state. Never awaits a probe: it only *starts* one in the
-   * background when the state is unknown or older than one poll interval, so
-   * readers still get an immediate (if older) answer.
+   * Last known state. Never awaits a probe and never re-probes a settled
+   * state, so readers always get the cached answer immediately — and an idle
+   * server never spawns a python process just because someone polled.
+   *
+   * Only an UNKNOWN state (no completed probe yet) lazily kicks off one probe,
+   * so a request arriving before the warm-up loop produced anything still gets
+   * an honest "warming up" answer that self-heals.
    */
   snapshot(): AvailabilitySnapshot {
-    if (!this.stopped) {
-      const aged = Date.now() - this.checkedAt >= this.pollIntervalMs;
-      if ((!this.value || (this.value.ok && aged)) && !this.inFlight) void this.refresh();
-    }
+    if (!this.stopped && !this.value && !this.inFlight) void this.refresh();
     return { value: this.value, checking: this.inFlight !== null };
   }
 
-  /** Non-blocking warm-up: probe now, then poll until available. Idempotent. */
+  /**
+   * Non-blocking warm-up: probe now, keep re-probing every `pollIntervalMs`
+   * while the engine is NOT available, and stop for good as soon as it is —
+   * so a warm server costs nothing (no periodic torch imports on a CPU-only
+   * laptop). Idempotent; `dispose`/`stop` tears the timer down.
+   */
   start(): void {
     if (this.stopped || this.timer) return;
     void this.refresh();
-    this.timer = setInterval(() => {
-      if (this.value?.ok) return; // warm — stop probing (see class docs)
-      void this.refresh();
-    }, this.pollIntervalMs);
+    this.timer = setInterval(() => this.poll(), this.pollIntervalMs);
     this.timer.unref();
+  }
+
+  private poll(): void {
+    if (this.value?.ok) {
+      this.clearTimer(); // warm — nothing left to poll (see class docs)
+      return;
+    }
+    void this.refresh();
+  }
+
+  private clearTimer(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
   }
 
   stop(): void {
     this.stopped = true;
-    if (this.timer) clearInterval(this.timer);
-    this.timer = undefined;
+    this.clearTimer();
   }
 
   /** Subscribe to completed probes (used for the startup log). */
@@ -93,8 +107,8 @@ export class AvailabilityMonitor {
       )
       .then((value: EngineAvailability): EngineAvailability => {
         this.value = value;
-        this.checkedAt = Date.now();
         this.inFlight = null;
+        if (value.ok) this.clearTimer(); // warm: polling has nothing left to do
         for (const listener of this.listeners) listener(value);
         return value;
       });
