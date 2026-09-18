@@ -59,8 +59,13 @@ export class MuScriptorEngine implements TranscriptionEngine {
     }
   }
 
-  /** Timeout after which a hung self-check is killed → honest unavailable. */
-  private selfCheckTimeoutMs = 30_000;
+  /**
+   * Timeout after which a hung self-check is killed → honest unavailable.
+   * A CPU-only cold start (torch import + gated-weight probe) takes 45-60s on
+   * an 8GB laptop, so a 30s budget aborted checks that were merely slow.
+   * Override with MUSCRIPTOR_SELFCHECK_TIMEOUT_MS.
+   */
+  private selfCheckTimeoutMs = 120_000;
 
   async available(forceRefresh = false): Promise<EngineAvailability> {
     const ttlMs = 60_000;

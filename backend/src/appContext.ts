@@ -43,6 +43,7 @@ export async function buildContext(overrides: ContextOverrides = {}): Promise<Ap
           workerPath: config.workerPath,
           model: config.model,
           timeoutMs: config.workerTimeoutMs,
+          selfCheckTimeoutMs: config.selfCheckTimeoutMs,
         }));
 
   const jobManager =

@@ -30,6 +30,12 @@ export interface Config {
   rateLimitWindowMs: number;
   rateLimitMax: number;
   workerTimeoutMs: number;
+  /**
+   * Budget for one MuScriptor `--self-check` run (python deps +
+   * gated-weight access). CPU-only cold start (torch import + ~400MB model
+   * metadata) takes 45-60s on an 8GB laptop, so the default is generous.
+   */
+  selfCheckTimeoutMs: number;
   /** Only whether a token exists; the value is only forwarded to the worker. */
   hfTokenPresent: boolean;
 }
@@ -68,6 +74,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     rateLimitWindowMs: int(env.RATE_LIMIT_WINDOW_MS, 60 * 1000),
     rateLimitMax: int(env.RATE_LIMIT_MAX, 10),
     workerTimeoutMs: int(env.WORKER_TIMEOUT_MS, 30 * 60 * 1000),
+    // Cold start (torch import + gated-weight probe) is 45-60s on CPU-only
+    // 8GB machines; 30s used to abort a check that was merely slow.
+    selfCheckTimeoutMs: int(env.MUSCRIPTOR_SELFCHECK_TIMEOUT_MS, 120_000),
     hfTokenPresent: !!env.HF_TOKEN && env.HF_TOKEN.trim() !== '',
   };
 }
