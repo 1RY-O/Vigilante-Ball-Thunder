@@ -9,12 +9,14 @@ test('upload → server states → real notation → playback and both exports',
   page.on('pageerror', error => errors.push(error.message))
   await page.goto('/')
   await expect(page.getByRole('button', { name: 'Choose a recording' })).toBeEnabled()
+  // The e2e server serves synthetic fixture data, so the UI must label it mock.
+  await expect(page.getByText('Demo engine active')).toBeVisible()
   await page.getByLabel('Choose audio recording').setInputFiles({ name: 'Morning melody.wav', mimeType: 'audio/wav', buffer: wav() })
   await expect(page.getByText('Recording selected')).toBeVisible()
   await page.getByRole('button', { name: 'Create sheet music' }).click()
-  await expect(page.getByText('Uploading recording', { exact: false }).first()).toBeVisible()
-  // Queued/transcribing are transient on fast backends (stub completes in
-  // ~1 poll), so they may never paint; the final readiness must appear.
+  // Uploading/queued/transcribing are transient on fast backends (real
+  // localhost stub completes in milliseconds), so they may never paint;
+  // the final readiness must appear either way.
   await expect(page.getByText('Your score is ready')).toBeVisible({ timeout: 30000 })
   const score = page.getByRole('img', { name: 'Sheet music, page 1' })
   const engraving = score.locator('svg.definition-scale')
@@ -37,6 +39,23 @@ test('upload → server states → real notation → playback and both exports',
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
   await page.screenshot({ path: testInfo.outputPath('mobile-result.png'), fullPage: true })
   expect(errors).toEqual([])
+})
+test('cancel mid-polling stops cleanly and asks the service to cancel', async ({ page }) => {
+  // Keep the job transcribing forever so the stop path is reachable; the
+  // DELETE must reach the service.
+  await page.route('**/api/transcriptions/mock-job-1', route => {
+    if (route.request().method() === 'DELETE') return route.fulfill({ status: 200, json: { id: 'mock-job-1', status: 'error', error: { code: 'cancelled', message: 'The transcription was cancelled.' } } })
+    return route.fulfill({ status: 200, json: { id: 'mock-job-1', status: 'transcribing', progress: 40 } })
+  })
+  await page.goto('/')
+  await page.getByLabel('Choose audio recording').setInputFiles({ name: 'Morning melody.wav', mimeType: 'audio/wav', buffer: wav() })
+  await page.getByRole('button', { name: 'Create sheet music' }).click()
+  await expect(page.getByText('Transcribing your recording')).toBeVisible({ timeout: 15000 })
+  const deleteSeen = page.waitForRequest(request => request.url().includes('/api/transcriptions/mock-job-1') && request.method() === 'DELETE')
+  await page.getByRole('button', { name: 'Stop waiting' }).click()
+  await deleteSeen
+  await expect(page.getByText('Recording selected')).toBeVisible()
+  await expect(page.getByText(/Stopped waiting here/)).toBeVisible()
 })
 test('unavailable service is honest and visually usable', async ({ page }, testInfo) => {
   await page.route('**/api/**', route => route.fulfill({ status: 503, body: 'private stack trace' }))

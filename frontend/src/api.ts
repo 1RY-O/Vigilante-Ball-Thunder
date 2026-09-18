@@ -1,6 +1,11 @@
-export interface Capabilities { formats: string[]; maxUploadBytes: number }
+export interface EngineInfo { name?: string; mock?: boolean; available?: boolean; reason?: string; model?: string }
+export interface Capabilities { formats: string[]; maxUploadBytes: number; engine?: EngineInfo; maxAudioDurationSec?: number }
 export interface Result { musicxmlUrl: string; midiUrl: string; audioUrl?: string }
-export interface Job { id: string; status: 'queued' | 'transcribing' | 'complete' | 'error'; progress?: number; result?: Result }
+export interface Job { id: string; status: 'queued' | 'transcribing' | 'complete' | 'error'; progress?: number; result?: Result; error?: { code: string; message: string } }
+// Curated failure codes the backend may attach to a job; a message is only
+// surfaced when its code is one of these, so a misbehaving backend can never
+// leak internals through the UI.
+const safeErrorCodes: readonly string[] = ['transcription-failed', 'engine-unavailable', 'empty-transcription', 'cancelled']
 const base = '/api'
 const formats = ['mp3', 'wav', 'flac']
 const unavailable = 'The transcription service is unavailable. Please try again in a moment.'
@@ -28,12 +33,44 @@ export async function capabilities(signal?: AbortSignal): Promise<Capabilities> 
   if (!Array.isArray(data?.formats) || !Number.isSafeInteger(data.maxUploadBytes) || data.maxUploadBytes <= 0) throw new ServiceError(unavailable)
   const supported = formats.filter(format => data.formats.includes(format))
   if (!supported.length) throw new ServiceError('No supported recording formats are available yet.')
-  return { formats: supported, maxUploadBytes: data.maxUploadBytes }
+  // Honesty gate: an engine that reports itself unavailable (e.g. missing
+  // HF token / gated MuScriptor weights) must surface as an error, not as
+  // an enabled upload flow.
+  if (data.engine && data.engine.available === false) {
+    throw new ServiceError(typeof data.engine.reason === 'string' && data.engine.reason ? data.engine.reason : unavailable)
+  }
+  const caps: Capabilities = { formats: supported, maxUploadBytes: data.maxUploadBytes }
+  if (data.engine && typeof data.engine === 'object') caps.engine = data.engine
+  if (Number.isSafeInteger(data.maxAudioDurationSec) && (data.maxAudioDurationSec ?? 0) > 0) caps.maxAudioDurationSec = data.maxAudioDurationSec
+  return caps
 }
 export function validateFile(file: File, caps: Capabilities): string | null {
   if (!caps.formats.includes(file.name.split('.').pop()?.toLowerCase() ?? '')) return `Choose a ${caps.formats.map(f => f.toUpperCase()).join(', ')} recording.`
   if (!file.size) return 'This file is empty. Please choose a recording with audio.'
   if (file.size > caps.maxUploadBytes) return `This recording is too large. The limit is ${Math.floor(caps.maxUploadBytes / 1024 / 1024)} MB.`
+  return null
+}
+/** Best-effort duration probe via the browser's audio decoder. Returns null
+ *  when undecidable; the backend still enforces duration independently. */
+export function probeDurationSec(file: File, timeoutMs = 8000): Promise<number | null> {
+  return new Promise(resolve => {
+    const url = URL.createObjectURL(file)
+    const audio = new Audio()
+    let settled = false
+    const finish = (value: number | null) => { if (!settled) { settled = true; clearTimeout(timer); URL.revokeObjectURL(url); resolve(value) } }
+    const timer = setTimeout(() => finish(null), timeoutMs)
+    audio.preload = 'metadata'
+    audio.onloadedmetadata = () => finish(Number.isFinite(audio.duration) ? audio.duration : null)
+    audio.onerror = () => finish(null)
+    audio.src = url
+  })
+}
+export function validateDuration(durationSec: number | null, caps: Capabilities): string | null {
+  if (durationSec === null || !caps.maxAudioDurationSec) return null
+  if (durationSec > caps.maxAudioDurationSec) {
+    const min = Math.round(caps.maxAudioDurationSec / 60)
+    return `This recording is too long. The limit is ${min} minute${min === 1 ? '' : 's'}.`
+  }
   return null
 }
 export function parseJob(value: unknown): Job {
@@ -44,6 +81,12 @@ export function parseJob(value: unknown): Job {
   if (data.status === 'complete') {
     if (!data.result) throw new ServiceError('The score is missing from the result. Please try again.')
     job.result = { musicxmlUrl: artifactUrl(data.result.musicxmlUrl), midiUrl: artifactUrl(data.result.midiUrl), ...(data.result.audioUrl ? { audioUrl: artifactUrl(data.result.audioUrl) } : {}) }
+  }
+  if (data.status === 'error') {
+    const err = (data as { error?: unknown }).error as { code?: unknown; message?: unknown } | undefined
+    if (err && typeof err.code === 'string' && safeErrorCodes.includes(err.code) && typeof err.message === 'string' && err.message) {
+      job.error = { code: err.code, message: err.message }
+    }
   }
   return job
 }
@@ -69,6 +112,10 @@ export function upload(file: File, signal: AbortSignal, onProgress: (progress: n
   })
 }
 export async function getJob(id: string, signal: AbortSignal) { return parseJob(await json(`${base}/transcriptions/${encodeURIComponent(id)}`, signal)) }
+export async function cancelJob(id: string): Promise<void> {
+  const response = await fetch(`${base}/transcriptions/${encodeURIComponent(id)}`, { method: 'DELETE', headers: { Accept: 'application/json' } })
+  if (!response.ok) throw new ServiceError(unavailable)
+}
 export async function getMusicXML(url: string, signal: AbortSignal) {
   const response = await fetch(url, { signal, headers: { Accept: 'application/vnd.recordare.musicxml+xml, application/xml' } })
   if (!response.ok) throw new ServiceError('The score could not be loaded. Please try again.')

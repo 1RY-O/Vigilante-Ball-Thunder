@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { artifactUrl, capabilities, friendlyError, getMusicXML, parseJob, upload, validateFile } from './api'
+import { artifactUrl, cancelJob, capabilities, friendlyError, getMusicXML, parseJob, upload, validateDuration, validateFile } from './api'
 const caps = { formats: ['mp3', 'wav', 'flac'], maxUploadBytes: 1024 * 1024 }
 describe('recording validation', () => {
   it.each(['mp3', 'WAV', 'flac'])('accepts supported %s files', extension => { expect(validateFile(new File(['sound'], `melody.${extension}`), caps)).toBeNull() })
@@ -18,6 +18,35 @@ describe('API boundary', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('secret /srv/private traceback', { status: 500 })))
     await expect(capabilities()).rejects.toThrow('service is unavailable')
     expect(friendlyError(new Error('secret'))).not.toContain('secret')
+  })
+  it('surfaces an unavailable engine honestly instead of enabling uploads', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ ...caps, engine: { name: 'muscriptor', mock: false, available: false, reason: 'HF_TOKEN is missing. Accept the model license and configure .env.' } })))
+    await expect(capabilities()).rejects.toThrow('HF_TOKEN is missing')
+  })
+  it('passes through mock-engine labeling and duration limits', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ ...caps, engine: { name: 'stub', mock: true, available: true }, maxAudioDurationSec: 600 })))
+    const result = await capabilities()
+    expect(result.engine?.mock).toBe(true)
+    expect(result.maxAudioDurationSec).toBe(600)
+  })
+  it('duration gate: over-limit recordings rejected, undecodable allowed (backend enforces)', () => {
+    const withLimit = { ...caps, maxAudioDurationSec: 60 }
+    expect(validateDuration(600, withLimit)).toMatch(/too long/)
+    expect(validateDuration(30, withLimit)).toBeNull()
+    expect(validateDuration(null, withLimit)).toBeNull()
+    expect(validateDuration(600, caps)).toBeNull() // no advertised limit -> no client gate
+  })
+  it('surfaces a curated job-error message only for known safe codes', () => {
+    expect(parseJob({ id: '1', status: 'error', error: { code: 'engine-unavailable', message: 'The engine could not run.' } }).error?.message).toBe('The engine could not run.')
+    expect(parseJob({ id: '1', status: 'error', error: { code: 'cancelled', message: 'The transcription was cancelled.' } }).error?.message).toBe('The transcription was cancelled.')
+    // Unknown codes must NOT leak their payload through the UI.
+    expect(parseJob({ id: '1', status: 'error', error: { code: 'weird', message: '/srv/private traceback' } }).error).toBeUndefined()
+  })
+  it('cancels a job via DELETE', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(cancelJob('job-1')).resolves.toBeUndefined()
+    expect(fetchMock).toHaveBeenCalledWith('/api/transcriptions/job-1', { method: 'DELETE', headers: { Accept: 'application/json' } })
   })
   it('validates complete results and optional progress', () => {
     expect(parseJob({ id: '1', status: 'transcribing', progress: 25 })).toEqual({ id: '1', status: 'transcribing', progress: 25 })

@@ -13,11 +13,12 @@ let polls = 0
 createServer((req, res) => {
   const path = new URL(req.url, 'http://mock').pathname
   const send = (code, body, type = 'application/json') => { res.writeHead(code, { 'Content-Type': type }); res.end(body) }
-  if (req.method === 'GET' && path === '/api/capabilities') return send(200, JSON.stringify({ formats: ['mp3', 'wav', 'flac'], maxUploadBytes: 20 * 1024 * 1024 }))
+  if (req.method === 'GET' && path === '/api/capabilities') return send(200, JSON.stringify({ formats: ['mp3', 'wav', 'flac'], maxUploadBytes: 20 * 1024 * 1024, engine: { name: 'stub', mock: true, available: true } }))
   if (req.method === 'POST' && path === '/api/transcriptions') {
     req.resume()
     return req.on('end', () => setTimeout(() => send(202, JSON.stringify({ id: 'mock-job-1', status: 'queued' })), 250))
   }
+  if (req.method === 'DELETE' && path === '/api/transcriptions/mock-job-1') return send(200, JSON.stringify({ id: 'mock-job-1', status: 'error', error: { code: 'cancelled', message: 'The transcription was cancelled.' } }))
   if (path === '/api/transcriptions/mock-job-1') {
     if (++polls === 1) return send(200, JSON.stringify({ id: 'mock-job-1', status: 'transcribing', progress: 40 }))
     return send(200, JSON.stringify({ id: 'mock-job-1', status: 'complete', result: { musicxmlUrl: '/api/artifacts/mock-job-1/musicxml', midiUrl: '/api/artifacts/mock-job-1/midi', audioUrl: '/api/artifacts/mock-job-1/audio' } }))

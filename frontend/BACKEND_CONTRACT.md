@@ -1,79 +1,147 @@
-# Frontend integration handoff — OpenCode
+# Backend contract — Vigilante Ball Thunder
 
-## Repository inspection
+**Status: implemented** (`backend/`, this repo). Earlier revisions of this
+document described a *proposed* contract; the endpoints below are now the
+real, tested backend. Frontend code lives in `frontend/src/api.ts`.
 
-The original checkout (`d985ff9`) contained only README, LICENSE and .gitignore. There was no package.json, frontend, router, backend, API contract or notation renderer. This frontend is isolated in `frontend/`; no backend implementation was added or changed. Verovio was selected because there was no existing renderer to preserve.
+## Honesty guarantees (hard rules, enforced by tests)
 
-**The endpoints below are proposed, not verified backend capabilities.** Adapt `frontend/src/api.ts` to the actual contract when OpenCode provides it. The app currently shows service-unavailable rather than fabricating results. No fixtures or fake jobs are served in production.
+- No fabricated results: the backend only serves MuScriptor output (or the
+  clearly-labeled stub engine, below). There is no hidden "fake success" path.
+- If MuScriptor cannot run (missing `HF_TOKEN`, license not accepted on Hugging
+  Face, deps missing, HF unreachable), `GET /api/capabilities` reports
+  `engine.available: false` with a safe `reason`, and `POST /api/transcriptions`
+  answers **503** `{ "error": "engine-unavailable", "code", "message" }`.
+  Covered by `backend/test/blocked.test.ts`.
+- `HF_TOKEN` and other env secrets are never logged or returned in responses.
+  Covered by a dedicated token-leak test.
 
-## Proposed same-origin contract
-
-All requests use `/api`. Configure your local/reverse proxy to route `/api` to the backend; Vite preview does not implement it. No keys or secrets belong in frontend configuration.
+## Endpoints
 
 ### GET /api/capabilities
 
 ```json
-{ "formats": ["mp3", "wav", "flac"], "maxUploadBytes": 52428800 }
-```
-
-Advertise only formats the deployed pipeline accepts. The UI enables only the intersection with MP3/WAV/FLAC. The byte limit must be a positive safe integer. Frontend extension/size checks are UX only: backend must independently validate content, size, decoding and authorization. Until capabilities succeed, file selection/upload is disabled.
-
-### POST /api/transcriptions
-
-Multipart form field **file**, one audio recording. Return 200/201/202 JSON:
-
-```json
-{ "id": "opaque-job-id", "status": "queued" }
-```
-
-### GET /api/transcriptions/{encoded-id}
-
-Poll every 1.5 seconds while queued/transcribing:
-
-```json
-{ "id": "opaque-job-id", "status": "transcribing", "progress": 35 }
-```
-
-Statuses: `queued`, `transcribing`, `complete`, `error`. Optional `progress` is actual percent 0–100, never an estimated timer. An immediate complete response to POST is also accepted.
-
-```json
 {
-  "id": "opaque-job-id",
-  "status": "complete",
-  "result": {
-    "musicxmlUrl": "/api/artifacts/opaque-score-id/musicxml",
-    "midiUrl": "/api/artifacts/opaque-score-id/midi",
-    "audioUrl": "/api/artifacts/opaque-score-id/audio"
+  "formats": ["wav", "mp3", "flac"],
+  "maxUploadBytes": 26214400,
+  "maxAudioDurationSec": 600,
+  "engine": {
+    "name": "muscriptor",
+    "mock": false,
+    "available": true,
+    "model": "small"
   }
 }
 ```
 
-MusicXML and MIDI are required. Audio is optional **browser-playable transcribed audio**, not a MIDI URL. Without it, playback explicitly says “Original recording” and uses a revocable local object URL. No synthesized MIDI playback or inferred audio/notation synchronization is claimed.
+- `formats` is exactly what the deployed pipeline accepts (libsndfile-backed
+  decoding). The frontend intersects this with its own MP3/WAV/FLAC support.
+- `maxAudioDurationSec` is advertised so the client can gate over-long files
+  optimistically; the backend enforces independently (WAV header check).
+- `engine.mock` is `true` ONLY for the stub engine (see below); the frontend
+  displays a "Demo engine active — synthetic fixture data" notice whenever
+  this is true.
+- `engine.available: false` MUST surface as an unavailable service in the UI,
+  using the safe `reason` string.
 
-### Artifact GETs
+### POST /api/transcriptions
 
-Return same-origin `/api/…` paths. External/signed-storage URLs and internal filesystem paths are deliberately not accepted. Serve raw uncompressed MusicXML (`score-partwise` or `score-timewise`, not MXL ZIP), MIDI bytes, and optional browser-playable audio. Use appropriate Content-Type and Content-Disposition download filenames. Support audio range requests when practical. Protect artifacts using the existing server authorization scheme; opaque IDs alone are not authorization.
+Multipart form field **file** (one recording) → `202 { "id", "status": "queued" }`.
 
-Errors may return any body: frontend does not display raw server text. HTTP 413/415/429/401/403 get safe user-facing messages; other failures are generic. Transcription error bodies are never surfaced. Provide safe structured error codes in a future agreed contract if more precise recovery is needed.
+- Validation: magic-byte sniffing (RIFF/WAVE, ID3/MPEG-sync, fLaC),
+  extension/content agreement, non-empty, `<= maxUploadBytes`, WAV duration
+  `<= maxAudioDurationSec`. Failures: 400 (no file), 413 (too large),
+  415 (type/mismatch/duration).
+- Optional text field `model`: `small | medium | large` (validated).
+- 503 when the engine is unavailable (see honesty guarantees).
+- 429 when the per-IP rate limit trips (`RATE_LIMIT_MAX` per
+  `RATE_LIMIT_WINDOW_MS`).
 
-## State semantics / limitations
+### GET /api/transcriptions/:id
 
-- Selected files are not uploaded until Create sheet music is pressed.
-- Upload percent comes from XHR transport events, not transcription progress.
-- Queued/transcribing are shown only after server confirmation.
-- Rendering means a completed backend score is being fetched/engraved locally.
-- Complete means Verovio produced notation pages.
-- Stop waiting aborts frontend requests only; it is **not** server-job cancellation. The UI says so. Polling stops after 30 minutes; no job persistence or resume endpoint is assumed.
-- Invalid MusicXML/render failures preserve available export links.
-- No PDF, editing, note-following or artificial sample score in production.
-- Timing data is absent. To add score-following, agree on stable MusicXML element IDs and a time-to-element mapping aligned to the returned playback audio; do not derive it from unrelated recording time.
+```json
+{ "id": "…", "status": "transcribing", "progress": 35 }
+```
 
-## Backend work still needed
+Statuses: `queued → transcribing → complete | error`.
+`progress` is a real percent reported by the engine, or absent — never
+estimated. On `complete`:
 
-1. Confirm or supply the real routes/schema; wire MuScriptor jobs and artifact storage.
-2. Provide truthful format/limit capabilities and independent upload validation.
-3. Provide generated MusicXML/MIDI and optionally playable synthesized audio.
-4. Configure same-origin routing, artifact authorization, retention and user-facing privacy policy.
-5. Agree on job cancellation/resume, structured errors, timing and PDF only if supported.
+```json
+{
+  "id": "…", "status": "complete",
+  "result": {
+    "musicxmlUrl": "/api/artifacts/<id>/musicxml",
+    "midiUrl": "/api/artifacts/<id>/midi"
+  }
+}
+```
 
-Browser tests intercept this proposed contract with a clearly labelled test-only MusicXML fixture. They validate frontend integration, **not** transcription quality or a live MuScriptor pipeline.
+On failure: `{ "id", "status": "error", "error": { "code", "message" } }` with
+a curated safe message (codes: `transcription-failed`, `engine-unavailable`,
+`empty-transcription`, `cancelled`). Internal stderr/paths are never exposed.
+Polling: 1.5 s interval; clients should stop on `complete`, `error`, or
+after 30 minutes (frontend implements all three). When the user chooses to
+stop waiting, the frontend calls `DELETE /api/transcriptions/:id` so the
+server-side job is cancelled (not just the local poll loop).
+
+### DELETE /api/transcriptions/:id
+
+Safe cancellation → `200` with the resulting job view:
+
+- queued job: dequeued, settles as `error { code: "cancelled" }`;
+- running job: worker process is killed (SIGTERM → SIGKILL), settles as
+  `error { code: "cancelled" }`;
+- already-terminal job: safe no-op (returns current state; finished artifacts
+  are NOT destroyed);
+- unknown id: `404`.
+
+Cancelled jobs' files are removed immediately; records stay until the TTL
+sweeper so the terminal state remains inspectable.
+
+### GET /api/artifacts/:id/musicxml
+
+`200` body: raw uncompressed MusicXML (`score-partwise`),
+`Content-Type: application/vnd.recordare.musicxml+xml`,
+`Content-Disposition: attachment; filename="transcription.musicxml"`.
+`404` unknown job, `409` job not complete.
+
+### GET /api/artifacts/:id/midi
+
+`200` body: MIDI bytes, `Content-Type: audio/midi`,
+`Content-Disposition: attachment; filename="transcription.mid"`.
+Same 404/409 semantics.
+
+### GET /api/health
+
+Liveness only (`{ "status": "ok" }`). Not needed by the UI.
+
+## Not implemented (honest gaps)
+
+- `result.audioUrl` (server-rendered playback of the transcription): not
+  available yet — the UI plays the user's original recording instead and says
+  "Original recording". MuScriptor's auralization needs FluidSynth + a
+  soundfont download; deliberately out of this milestone.
+- Job persistence across restarts; auth/user accounts; PDF export.
+
+## Engines
+
+- **muscriptor** (default): `backend/python/transcribe_worker.py` runs
+  `muscriptor` (MIDI) + `music21` (MIDI→MusicXML) in a subprocess. Streams
+  real progress over stdout JSONL. Requires `backend/.venv`
+  (see `backend/python/requirements.txt`) and `HF_TOKEN` in `backend/.env`
+  after accepting the model license (weights are CC BY-NC 4.0 gated).
+- **stub** (`TRANSCRIPTION_ENGINE=stub`): ⚠️ MOCK. Emits a fixed synthetic
+  fixture (constant C–E–G–C melody) with NO model involvement. Labeled as
+  mock in code (`StubEngine.isMock`), startup logs, `GET /api/capabilities`
+  (`engine.mock: true`), and the UI ("Demo engine active"). Never use for
+  real output. Exists so the full backend/frontend path can be exercised
+  offline and in CI.
+
+## E2E test doubles
+
+`frontend/e2e/mock-server.mjs` is a TEST-ONLY, protocol-level mock server
+used by `npm run test:e2e`. It does not run any of the backend. The same
+browser suite can run against the real backend via
+`playwright.live.config.ts` (typically with `TRANSCRIPTION_ENGINE=stub`,
+which keeps outputs synthetic but exercises the real backend code).

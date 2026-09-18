@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { capabilities, friendlyError, getJob, getMusicXML, upload, validateFile, ServiceError } from './api'
+import { capabilities, cancelJob, friendlyError, getJob, getMusicXML, probeDurationSec, upload, validateDuration, validateFile, ServiceError } from './api'
 import type { Capabilities, Result } from './api'
 import ScoreViewer from './ScoreViewer'
 import Playback from './Playback'
@@ -29,6 +29,8 @@ export default function App() {
   const [xml, setXml] = useState('')
   const [dragging, setDragging] = useState(false)
   const operation = useRef<AbortController | null>(null)
+  const jobId = useRef<string | null>(null)
+  const selection = useRef(0)
   const picker = useRef<HTMLInputElement>(null)
   const busy = ['uploading', 'queued', 'transcribing', 'rendering'].includes(stage)
   useEffect(() => {
@@ -44,11 +46,21 @@ export default function App() {
     return () => URL.revokeObjectURL(url)
   }, [file])
   useEffect(() => () => operation.current?.abort(), [])
-  function select(files: File[]) {
+  async function select(files: File[]) {
     if (busy || !caps) return
+    const token = ++selection.current
     if (files.length !== 1) { setError('Please choose one recording at a time.'); return }
     const issue = validateFile(files[0], caps)
     if (issue) { setError(issue); return }
+    // Best-effort duration gate, only when the service advertises a limit
+    // (browsers that cannot decode the file return null; the backend still
+    // enforces duration independently).
+    if (caps.maxAudioDurationSec) {
+      const duration = await probeDurationSec(files[0])
+      if (token !== selection.current) return
+      const tooLong = validateDuration(duration, caps)
+      if (tooLong) { setError(tooLong); return }
+    }
     operation.current?.abort()
     setFile(files[0]); setError(''); setResult(null); setXml(''); setStage('selected'); setProgress(undefined)
   }
@@ -60,6 +72,7 @@ export default function App() {
     setError(''); setResult(null); setXml(''); setStage('uploading'); setProgress(undefined)
     try {
       let job = await upload(file, controller.signal, setProgress)
+      jobId.current = job.id
       const started = Date.now()
       while (job.status === 'queued' || job.status === 'transcribing') {
         setStage(job.status); setProgress(job.progress)
@@ -67,7 +80,7 @@ export default function App() {
         await wait(controller.signal)
         job = await getJob(job.id, controller.signal)
       }
-      if (job.status === 'error' || !job.result) throw new ServiceError('Transcription could not be completed. Try a shorter, clearer recording in a supported format.')
+      if (job.status === 'error' || !job.result) throw new ServiceError(job.error?.message ?? 'Transcription could not be completed. Try a shorter, clearer recording in a supported format.')
       setResult(job.result); setStage('rendering'); setProgress(undefined)
       const notation = await getMusicXML(job.result.musicxmlUrl, controller.signal)
       if (!controller.signal.aborted) setXml(notation)
@@ -75,7 +88,13 @@ export default function App() {
   }
   const ready = useCallback(() => setStage('complete'), [])
   const renderError = useCallback(() => { setStage('error'); setError('The notation could not be displayed. You can still download your files below.') }, [])
-  function stop() { operation.current?.abort(); setStage(file ? 'selected' : 'idle'); setProgress(undefined); setError('Stopped waiting here. A submitted transcription may still finish on the service.') }
+  function stop() {
+    operation.current?.abort()
+    const id = jobId.current
+    jobId.current = null
+    if (id) cancelJob(id).catch(() => {})
+    setStage(file ? 'selected' : 'idle'); setProgress(undefined); setError('Stopped waiting here. The service was asked to cancel the transcription.')
+  }
 
   return <div className="app-shell">
     <header className="site-header"><a className="brand" href="/" aria-label="Vigilante Ball Thunder home"><span className="brand-mark" aria-hidden="true">♫</span><span>Vigilante Ball Thunder<small>A recording. A manuscript.</small></span></a><span className="header-note">Made for the music you make</span></header>
@@ -85,6 +104,7 @@ export default function App() {
         <section className="upload-section" aria-labelledby="upload-title"><div className="section-heading"><span className="section-number">01</span><h2 id="upload-title">Start with a recording</h2></div>
           {checking && <p className="service-note" role="status">Checking available audio formats…</p>}
           {serviceError && <div className="notice" role="alert"><strong>Transcription isn’t connected yet</strong><p>{serviceError} No recording has been uploaded.</p><button onClick={() => setRetry(n => n + 1)}>Check connection</button></div>}
+          {!serviceError && caps?.engine?.mock && <div className="notice" role="note"><strong>Demo engine active</strong><p>The backend is running its MOCK test engine: results are synthetic fixture data, not a real transcription.</p></div>}
           <div className={`drop-zone ${dragging ? 'dragging' : ''}`} onDragOver={e => { e.preventDefault(); if (caps && !busy) setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={e => { e.preventDefault(); setDragging(false); select(Array.from(e.dataTransfer.files)) }}>
             <span className="upload-symbol" aria-hidden="true">↑</span><h3>{file ? file.name : 'Let your music begin here'}</h3><p>{file ? `${(file.size / 1024 / 1024).toFixed(1)} MB` : 'Drag a recording into this space'}</p>
             <input ref={picker} className="sr-only" type="file" aria-label="Choose audio recording" accept={caps?.formats.map(f => `.${f}`).join(',') ?? '.mp3,.wav,.flac'} disabled={!caps || busy} onChange={e => { if (e.target.files?.length) select(Array.from(e.target.files)); e.target.value = '' }} />
