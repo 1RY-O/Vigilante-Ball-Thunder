@@ -36,6 +36,11 @@ export interface Config {
    * metadata) takes 45-60s on an 8GB laptop, so the default is generous.
    */
   selfCheckTimeoutMs: number;
+  /**
+   * Re-probe interval used by the background warm-up while the engine is not
+   * yet known to be available. Polling stops once it is available.
+   */
+  warmupIntervalMs: number;
   /** Only whether a token exists; the value is only forwarded to the worker. */
   hfTokenPresent: boolean;
 }
@@ -77,6 +82,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // Cold start (torch import + gated-weight probe) is 45-60s on CPU-only
     // 8GB machines; 30s used to abort a check that was merely slow.
     selfCheckTimeoutMs: int(env.MUSCRIPTOR_SELFCHECK_TIMEOUT_MS, 120_000),
+    warmupIntervalMs: Math.max(1_000, int(env.MUSCRIPTOR_WARMUP_INTERVAL_MS, 30_000)),
     hfTokenPresent: !!env.HF_TOKEN && env.HF_TOKEN.trim() !== '',
   };
 }

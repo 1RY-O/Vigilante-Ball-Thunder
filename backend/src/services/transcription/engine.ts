@@ -33,6 +33,13 @@ export interface EngineResult {
  */
 export const SELF_CHECK_TIMEOUT_CODE = 'self-check-timeout';
 
+/**
+ * Honest placeholder used while the first background probe is still running:
+ * the engine is neither known-good nor known-broken. It is not a fabricated
+ * success and not a real failure — the warm-up replaces it with a real result.
+ */
+export const ENGINE_WARMING_UP_CODE = 'engine-warming-up';
+
 /** Honest availability status surfaced verbatim in GET /api/capabilities. */
 export interface EngineAvailability {
   ok: boolean;
@@ -42,14 +49,32 @@ export interface EngineAvailability {
   reason?: string;
 }
 
+/** Reported by requests before the first completed probe (see monitor). */
+export const ENGINE_WARMING_UP: EngineAvailability = {
+  ok: false,
+  code: ENGINE_WARMING_UP_CODE,
+  reason:
+    'MuScriptor is warming up after a cold start. The first availability check can take under a minute; the status updates automatically.',
+};
+
 export interface TranscriptionEngine {
   /** 'muscriptor' | 'stub' */
   readonly name: string;
   /** true ONLY for the mock/stub engine. Real engines are never mock. */
   readonly isMock: boolean;
-  /** Check whether the engine can actually run jobs right now. */
-  available(): Promise<EngineAvailability>;
+  /**
+   * Check whether the engine can actually run jobs right now.
+   * `forceRefresh` bypasses the engine-internal cache (used by the background
+   * availability monitor so a poll is always a real check). Callers that must
+   * never block should read AvailabilityMonitor.snapshot() instead.
+   */
+  available(forceRefresh?: boolean): Promise<EngineAvailability>;
   transcribe(req: TranscribeRequest, onProgress: ProgressReporter): Promise<EngineResult>;
+  /**
+   * Optional: release engine-owned resources on shutdown (e.g. kill an
+   * in-flight availability probe so nothing is left orphaned).
+   */
+  dispose?(): void;
 }
 
 export type ProgressReporter = (stage: string, percent?: number) => void;

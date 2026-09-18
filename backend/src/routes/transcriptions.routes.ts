@@ -2,7 +2,7 @@ import { Router } from 'express';
 import type { Request, Response, NextFunction } from 'express';
 
 import { isSupportedModel } from '../config.js';
-import { EngineUnavailableError, TranscriptionError } from '../services/transcription/engine.js';
+import { EngineUnavailableError, ENGINE_WARMING_UP, ENGINE_WARMING_UP_CODE, TranscriptionError } from '../services/transcription/engine.js';
 import { validateStagedUpload, ValidationError, wavDurationFromHeader, SUPPORTED_FORMATS } from '../services/audio/validation.js';
 import { toPublicJob } from '../services/transcription/jobManager.js';
 import { removeTree } from '../utils/paths.js';
@@ -45,8 +45,16 @@ export function buildTranscriptionsRouter(ctx: AppContext): Router {
         }
         // Honest gate: if the real engine cannot run (missing deps/token),
         // fail here with 503 — never queue a job that would fake success.
-        const availability = await ctx.engine.available();
+        // The gate reads the LAST KNOWN state (never blocks); while it is
+        // still unknown (cold start) or known-bad it 503s honestly and pokes
+        // the background warm-up, so the next request sees a fresher answer.
+        const availability = ctx.availability.snapshot().value;
+        if (!availability) {
+          void ctx.availability.refresh();
+          throw new EngineUnavailableError(ENGINE_WARMING_UP.reason ?? 'The engine is warming up.', ENGINE_WARMING_UP_CODE);
+        }
         if (!availability.ok) {
+          void ctx.availability.refresh();
           throw new EngineUnavailableError(
             availability.reason ?? 'The transcription engine is currently unavailable.',
             availability.code ?? 'engine-unavailable',
@@ -127,26 +135,30 @@ export function buildCapabilitiesRouter(ctx: AppContext): Router {
 
   // GET /api/capabilities — truthful view of what this deployment can do,
   // including whether the engine is real or the labeled mock, and whether
-  // MuScriptor is actually ready (deps + HF access) right now.
-  router.get(
-    '/capabilities',
-    asyncH(async (_req, res) => {
-      const availability = await ctx.engine.available();
-      res.json({
-        formats: [...SUPPORTED_FORMATS],
-        maxUploadBytes: ctx.config.maxUploadBytes,
-        maxAudioDurationSec: ctx.config.maxAudioDurationSec,
-        engine: {
-          name: ctx.engine.name,
-          mock: ctx.engine.isMock,
-          available: availability.ok,
-          ...(availability.reason ? { reason: availability.reason } : {}),
-          ...(availability.code ? { code: availability.code } : {}),
-          model: ctx.config.model,
-        },
-      });
-    }),
-  );
+  // MuScriptor is actually ready (deps + HF access).
+  //
+  // This handler NEVER blocks: it answers from the last-known state and lets
+  // the background warm-up/poller update it. `engine.available` is only ever
+  // derived from a completed real probe; `engine.checking` says a fresh probe
+  // is in flight (so a false value during warm-up is not a verdict).
+  router.get('/capabilities', (_req, res) => {
+    const { value, checking } = ctx.availability.snapshot();
+    const availability = value ?? ENGINE_WARMING_UP;
+    res.json({
+      formats: [...SUPPORTED_FORMATS],
+      maxUploadBytes: ctx.config.maxUploadBytes,
+      maxAudioDurationSec: ctx.config.maxAudioDurationSec,
+      engine: {
+        name: ctx.engine.name,
+        mock: ctx.engine.isMock,
+        available: availability.ok,
+        checking,
+        ...(availability.reason ? { reason: availability.reason } : {}),
+        ...(availability.code ? { code: availability.code } : {}),
+        model: ctx.config.model,
+      },
+    });
+  });
 
   // GET /api/health — liveness only (not part of the frontend contract).
   router.get('/health', (_req, res) => {

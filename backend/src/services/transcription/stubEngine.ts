@@ -40,6 +40,8 @@ export class StubEngine implements TranscriptionEngine {
   readonly isMock = true;
 
   async available(): Promise<EngineAvailability> {
+    // The MOCK has no subprocess and no cache: it is always "available", and
+    // every result it produces is labeled synthetic fixture data.
     return {
       ok: true,
       code: 'stub-mock',

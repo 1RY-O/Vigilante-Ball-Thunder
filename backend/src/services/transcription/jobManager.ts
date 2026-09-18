@@ -7,6 +7,7 @@ import {
 import type { TranscriptionEngine } from './engine.js';
 import type { Job, JobError, JobResult, PublicStatus } from '../../types/job.js';
 import { newId } from '../../utils/id.js';
+import { safeMessage } from '../../utils/messages.js';
 import { makeIsolatedDir, removeTree } from '../../utils/paths.js';
 
 /**
@@ -200,11 +201,6 @@ function toJobError(e: unknown): JobError {
     return { code: 'transcription-failed', message: safeMessage(e.message) };
   }
   return { code: 'transcription-failed', message: 'Transcription failed.' };
-}
-
-/** Strip anything that looks like a filesystem path from client messages. */
-function safeMessage(message: string): string {
-  return message.replace(/(\/[^\s:]+)+/g, '[path]').slice(0, 300);
 }
 
 const INTERNAL_TO_PUBLIC: Record<Job['status'], PublicStatus> = {

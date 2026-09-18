@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
@@ -41,6 +42,8 @@ export class MuScriptorEngine implements TranscriptionEngine {
   private readonly timeoutMs: number;
   private readonly baseEnv: NodeJS.ProcessEnv;
   private cachedAvailability: { at: number; value: EngineAvailability } | null = null;
+  /** In-flight `--self-check` child, tracked so shutdown can kill it. */
+  private selfCheckChild: ChildProcess | null = null;
 
   constructor(opts: {
     pythonBin: string;
@@ -211,6 +214,18 @@ export class MuScriptorEngine implements TranscriptionEngine {
     return { midiPath, musicXmlPath, durationSec, model };
   }
 
+  /**
+   * Kill an in-flight availability probe (called on shutdown). Without this a
+   * cold-start self-check could outlive the server as an orphan python
+   * process. A no-op when no probe is running; the pending available() call
+   * then settles honestly (never as a fake "ready").
+   */
+  dispose(): void {
+    const child = this.selfCheckChild;
+    this.selfCheckChild = null;
+    if (child) child.kill('SIGKILL');
+  }
+
   private runSelfCheck(): Promise<EngineAvailability> {
     return new Promise((resolve) => {
       let settled = false;
@@ -218,12 +233,14 @@ export class MuScriptorEngine implements TranscriptionEngine {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (this.selfCheckChild === child) this.selfCheckChild = null;
         resolve(value);
       };
       const child = spawn(this.pythonBin, [this.workerPath, '--self-check', '--model', this.model], {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: this.baseEnv,
       });
+      this.selfCheckChild = child;
       // A hung self-check (slow torch import on an 8GB laptop) is killed and
       // reported with a dedicated code, so callers can tell "still warming up"
       // apart from a real blocker (missing token/deps/license).
