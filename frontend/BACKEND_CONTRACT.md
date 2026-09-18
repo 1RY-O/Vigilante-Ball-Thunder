@@ -77,9 +77,13 @@ estimated. On `complete`:
 }
 ```
 
-On failure: `{ "id", "status": "error", "error": { "code", "message" } }` with
+On failure: `{ "id", "status": "error", "error": { "code", "message", "cause" } }` with
 a curated safe message (codes: `transcription-failed`, `engine-unavailable`,
 `empty-transcription`, `cancelled`). Internal stderr/paths are never exposed.
+`cause` is an optional curated worker code (allow-list: `hf-token-missing`,
+`weights-gated`, `hf-unreachable`, `worker-deps-missing`, `python-not-found`,
+`worker-args-invalid`). Never carries paths, tokens, or stderr. The frontend
+MAY use it for precise operator-facing copy; ignoring it is safe.
 Polling: 1.5 s interval; clients should stop on `complete`, `error`, or
 after 30 minutes (frontend implements all three). When the user chooses to
 stop waiting, the frontend calls `DELETE /api/transcriptions/:id` so the
