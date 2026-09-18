@@ -43,6 +43,26 @@ real, tested backend. Frontend code lives in `frontend/src/api.ts`.
   this is true.
 - `engine.available: false` MUST surface as an unavailable service in the UI,
   using the safe `reason` string.
+- `engine.checking` (optional boolean): `true` while a fresh availability
+  probe is in flight. `available: false` + `checking: true` is warm-up in
+  progress, NOT a final verdict; `checking: false` (or absent) means settled.
+- `engine.code` (optional string): may be `"engine-warming-up"` before the
+  first probe finishes (first ~60 s after backend start/restart). Other
+  settled codes use the curated worker vocabulary (`hf-token-missing`,
+  `weights-gated`, `hf-unreachable`, `worker-deps-missing`,
+  `python-not-found`, `worker-args-invalid`, `engine-unavailable`).
+- Rule: `available: false` + `checking: true` (or `code:
+  "engine-warming-up"`) MUST render as "warming up", never as a final
+  "unavailable" failure. `available: false` + `checking: false` MUST render
+  as `Transcription isn't available: <reason>` with the code shown when it
+  is a known curated value.
+- Frontend polling-while-warming: while the engine reports warming-up, the
+  UI re-fetches `GET /api/capabilities` starting after 2 s with exponential
+  backoff capped at 5 s, stopping when `available` becomes `true` (ready),
+  when `checking` becomes `false` with `available` still `false` (honest
+  failure with the real code), on unmount (timer cleared, no leaked
+  intervals), or after ~5 minutes (shows "still warming up — try reloading"
+  and stops).
 
 ### POST /api/transcriptions
 
