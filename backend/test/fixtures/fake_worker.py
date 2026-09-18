@@ -12,6 +12,10 @@ test fixtures, clearly not real transcription):
   fail      emit a transcription-failed error and exit 3
   gated     emit a weights-gated error and exit 4
   no-token  (self-check) emit hf-token-missing and exit 4
+  slow-self-check  (self-check) sleep past the budget, then exit 0; the engine
+             must kill it and report an honest self-check-timeout
+  delay-self-check (self-check) succeed after ~0.6s (slow-but-healthy cold
+             start: proves warm-up never blocks requests)
   no-write  exit 0 without producing artifacts (engine must detect this)
   crash     print non-JSON noise and exit 2
   sleep     sleep ~25s (used by cancellation tests; killed by the engine)
@@ -59,6 +63,17 @@ def main() -> int:
     if "--self-check" in sys.argv:
         if mode == "no-token":
             fail("hf-token-missing", "HF_TOKEN is missing (simulated by test fixture).", 4)
+        if mode == "slow-self-check":
+            # Simulated CPU-only cold start (torch import + gated-weight probe)
+            # that outlives the budget: emits NOTHING, so the only honest
+            # outcome is the engine killing it and reporting a timeout.
+            time.sleep(5)
+            emit({"type": "ok"})
+            return 0
+        if mode == "delay-self-check":
+            # Slow-but-healthy check: still verifies, the request paths must not
+            # wait for it.
+            time.sleep(0.6)
         emit({"type": "ok"})
         return 0
 

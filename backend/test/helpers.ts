@@ -6,6 +6,7 @@ import type { Express } from 'express';
 import request from 'supertest';
 
 import { buildContext } from '../src/appContext.js';
+import type { AppContext } from '../src/appContext.js';
 import { createApp } from '../src/app.js';
 import { StubEngine } from '../src/services/transcription/stubEngine.js';
 import { MuScriptorEngine } from '../src/services/transcription/muScriptorEngine.js';
@@ -18,6 +19,8 @@ export const REAL_WORKER = path.resolve(HERE, '..', 'python', 'transcribe_worker
 export interface TestApp {
   app: Express;
   agent: ReturnType<typeof request>;
+  /** Full context — lets tests drive the availability monitor directly. */
+  ctx: AppContext;
   tmpRoot: string;
   cleanup: () => Promise<void>;
 }
@@ -35,6 +38,11 @@ export async function makeTestApp(opts: {
   engine: 'stub' | 'muscriptor-fake';
   workerMode?: string;
   config?: Partial<Config>;
+  /**
+   * Run the availability probe before returning (default true) so tests never
+   * race the cold-start window. Set false to observe the warm-up behaviour.
+   */
+  prewarm?: boolean;
 }): Promise<TestApp> {
   const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'vbt-backend-test-'));
   const config: Partial<Config> = {
@@ -61,14 +69,21 @@ export async function makeTestApp(opts: {
           workerPath: FAKE_WORKER,
           model: config.model ?? 'small',
           timeoutMs: config.workerTimeoutMs ?? 15_000,
+          selfCheckTimeoutMs: config.selfCheckTimeoutMs ?? 120_000,
           env,
         });
 
   const ctx = await buildContext({ config, engine });
   const app = createApp(ctx);
+  // Deterministic starting state: run the SAME real probe the background
+  // warm-up would run, so tests never race the cold-start window. The probe is
+  // an honest engine check (stub = instant, fake worker = instant); nothing is
+  // fabricated by seeding the monitor.
+  if (opts.prewarm !== false) await ctx.availability.refresh();
   return {
     app,
     agent: request(app),
+    ctx,
     tmpRoot,
     cleanup: async () => {
       await ctx.dispose();

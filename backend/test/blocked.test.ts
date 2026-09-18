@@ -55,6 +55,9 @@ describe('blocked MuScriptor is honest (no fabrication)', () => {
     try {
       const app = createApp(ctx);
       const agent = request(app);
+      // /api/capabilities answers from the last known state, so seed the SAME
+      // real probe the background warm-up would run before asserting.
+      await ctx.availability.refresh();
       const caps = await agent.get('/api/capabilities');
       expect(caps.body.engine.available).toBe(false);
       expect(caps.body.engine.code).toBe('python-not-found');
@@ -85,6 +88,7 @@ describe('blocked MuScriptor is honest (no fabrication)', () => {
     try {
       const app = createApp(ctx);
       const agent = request(app);
+      await ctx.availability.refresh();
       const caps = await agent.get('/api/capabilities');
       expect(JSON.stringify(caps.body)).not.toContain(token);
       const health = await agent.get('/api/health');
