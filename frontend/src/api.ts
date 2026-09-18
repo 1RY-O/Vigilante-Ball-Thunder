@@ -1,7 +1,7 @@
 export interface EngineInfo { name?: string; mock?: boolean; available?: boolean; reason?: string; model?: string }
 export interface Capabilities { formats: string[]; maxUploadBytes: number; engine?: EngineInfo; maxAudioDurationSec?: number }
 export interface Result { musicxmlUrl: string; midiUrl: string; audioUrl?: string }
-export interface Job { id: string; status: 'queued' | 'transcribing' | 'complete' | 'error'; progress?: number; result?: Result; error?: { code: string; message: string } }
+export interface Job { id: string; status: 'queued' | 'transcribing' | 'complete' | 'error'; progress?: number; result?: Result; error?: { code: string; message: string; cause?: string } }
 // Curated failure codes the backend may attach to a job; a message is only
 // surfaced when its code is one of these, so a misbehaving backend can never
 // leak internals through the UI.
