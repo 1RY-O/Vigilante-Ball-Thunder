@@ -64,13 +64,38 @@ it('surfaces the backend reason when the transcription engine is unavailable', a
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({
     formats: ['wav', 'mp3', 'flac'],
     maxUploadBytes: 1024 * 1024,
-    engine: { name: 'muscriptor', mock: false, available: false, reason },
+    engine: { name: 'muscriptor', mock: false, available: false, checking: false, reason },
   })))
   render(<App />)
-  // The notice renders the reason followed by "No recording has been uploaded."
+  // Settled failures render "Transcription isn't available: <reason>", never "warming up".
   expect(await screen.findByText(reason, { exact: false })).toBeInTheDocument()
+  expect(screen.getByText('Transcription isn’t available')).toBeInTheDocument()
+  expect(screen.queryByText(/warming up/i)).not.toBeInTheDocument()
   expect(screen.getByRole('button', { name: 'Choose a recording' })).toBeDisabled()
 })
+it('polls capabilities while warming up and auto-recovers without reload', async () => {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(Response.json({
+      formats: ['mp3', 'wav', 'flac'],
+      maxUploadBytes: 1024 * 1024,
+      engine: { name: 'muscriptor', mock: false, available: false, checking: true, code: 'engine-warming-up', reason: 'Engine is warming up.' },
+    }))
+    .mockResolvedValue(Response.json({
+      formats: ['mp3', 'wav', 'flac'],
+      maxUploadBytes: 1024 * 1024,
+      engine: { name: 'muscriptor', mock: false, available: true },
+    }))
+  vi.stubGlobal('fetch', fetchMock)
+  render(<App />)
+  // Warming copy, never the final "unavailable" verdict.
+  expect(await screen.findByText(/this can take up to a minute on first start/i)).toBeInTheDocument()
+  expect(screen.queryByText('Transcription isn’t available')).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Choose a recording' })).toBeDisabled()
+  // Auto-recovers to ready without a page reload (poll every ~2s).
+  await waitFor(() => expect(screen.getByLabelText('Choose audio recording')).toBeEnabled(), { timeout: 10000 })
+  expect(screen.queryByText(/this can take up to a minute on first start/i)).not.toBeInTheDocument()
+  expect(fetchMock.mock.calls.filter(([url]) => url === '/api/capabilities').length).toBeGreaterThanOrEqual(2)
+}, 15000)
 it('labels results honestly when the backend runs its labeled mock engine', async () => {
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({
     formats: ['wav'],

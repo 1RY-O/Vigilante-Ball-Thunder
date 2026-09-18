@@ -1,4 +1,4 @@
-export interface EngineInfo { name?: string; mock?: boolean; available?: boolean; reason?: string; model?: string }
+export interface EngineInfo { name?: string; mock?: boolean; available?: boolean; checking?: boolean; code?: string; reason?: string; model?: string }
 export interface Capabilities { formats: string[]; maxUploadBytes: number; engine?: EngineInfo; maxAudioDurationSec?: number }
 export interface Result { musicxmlUrl: string; midiUrl: string; audioUrl?: string }
 export interface Job { id: string; status: 'queued' | 'transcribing' | 'complete' | 'error'; progress?: number; result?: Result; error?: { code: string; message: string; cause?: string } }
@@ -33,12 +33,10 @@ export async function capabilities(signal?: AbortSignal): Promise<Capabilities> 
   if (!Array.isArray(data?.formats) || !Number.isSafeInteger(data.maxUploadBytes) || data.maxUploadBytes <= 0) throw new ServiceError(unavailable)
   const supported = formats.filter(format => data.formats.includes(format))
   if (!supported.length) throw new ServiceError('No supported recording formats are available yet.')
-  // Honesty gate: an engine that reports itself unavailable (e.g. missing
-  // HF token / gated MuScriptor weights) must surface as an error, not as
-  // an enabled upload flow.
-  if (data.engine && data.engine.available === false) {
-    throw new ServiceError(typeof data.engine.reason === 'string' && data.engine.reason ? data.engine.reason : unavailable)
-  }
+  // The engine state is returned as-is so the caller can distinguish
+  // "warming up" (available:false + checking:true / code engine-warming-up)
+  // from a settled failure (available:false + checking:false). Throwing
+  // here would freeze the UI on the first probe after a backend restart.
   const caps: Capabilities = { formats: supported, maxUploadBytes: data.maxUploadBytes }
   if (data.engine && typeof data.engine === 'object') caps.engine = data.engine
   if (Number.isSafeInteger(data.maxAudioDurationSec) && (data.maxAudioDurationSec ?? 0) > 0) caps.maxAudioDurationSec = data.maxAudioDurationSec

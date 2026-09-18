@@ -19,9 +19,18 @@ describe('API boundary', () => {
     await expect(capabilities()).rejects.toThrow('service is unavailable')
     expect(friendlyError(new Error('secret'))).not.toContain('secret')
   })
-  it('surfaces an unavailable engine honestly instead of enabling uploads', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ ...caps, engine: { name: 'muscriptor', mock: false, available: false, reason: 'HF_TOKEN is missing. Accept the model license and configure .env.' } })))
-    await expect(capabilities()).rejects.toThrow('HF_TOKEN is missing')
+  it('returns settled engine failures to the caller instead of throwing (App renders them)', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ ...caps, engine: { name: 'muscriptor', mock: false, available: false, checking: false, reason: 'HF_TOKEN is missing. Accept the model license and configure .env.' } })))
+    const result = await capabilities()
+    expect(result.engine?.available).toBe(false)
+    expect(result.engine?.reason).toMatch('HF_TOKEN is missing')
+  })
+  it('returns warming-up state to the caller instead of throwing (App polls)', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ ...caps, engine: { name: 'muscriptor', mock: false, available: false, checking: true, code: 'engine-warming-up', reason: 'Engine is warming up.' } })))
+    const result = await capabilities()
+    expect(result.engine?.available).toBe(false)
+    expect(result.engine?.checking).toBe(true)
+    expect(result.engine?.code).toBe('engine-warming-up')
   })
   it('passes through mock-engine labeling and duration limits', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ ...caps, engine: { name: 'stub', mock: true, available: true }, maxAudioDurationSec: 600 })))

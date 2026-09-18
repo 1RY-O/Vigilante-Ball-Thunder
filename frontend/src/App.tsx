@@ -1,9 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { capabilities, cancelJob, friendlyError, getJob, getMusicXML, probeDurationSec, upload, validateDuration, validateFile, ServiceError } from './api'
-import type { Capabilities, Result } from './api'
+import type { Capabilities, EngineInfo, Result } from './api'
 import ScoreViewer from './ScoreViewer'
 import Playback from './Playback'
 import './App.css'
+
+export const WARM_POLL_FIRST_MS = 2000
+export const WARM_POLL_MAX_MS = 5000
+export const WARM_POLL_BUDGET_MS = 5 * 60 * 1000
+const KNOWN_ENGINE_CODES: readonly string[] = ['engine-warming-up', 'engine-unavailable', 'hf-token-missing', 'weights-gated', 'hf-unreachable', 'worker-deps-missing', 'python-not-found', 'worker-args-invalid']
+export function isEngineWarming(engine?: EngineInfo | null): boolean {
+  if (!engine || engine.available !== false) return false
+  return engine.checking === true || engine.code === 'engine-warming-up'
+}
+export function isEngineFailed(engine?: EngineInfo | null): boolean {
+  if (!engine || engine.available !== false) return false
+  return !isEngineWarming(engine)
+}
 
 type Stage = 'idle' | 'selected' | 'uploading' | 'queued' | 'transcribing' | 'rendering' | 'complete' | 'error'
 const labels: Record<Stage, string> = { idle: 'Ready for a recording', selected: 'Recording selected', uploading: 'Uploading recording', queued: 'Waiting for transcription', transcribing: 'Transcribing your recording', rendering: 'Engraving your sheet music', complete: 'Your score is ready', error: 'Something needs attention' }
@@ -19,6 +32,7 @@ export default function App() {
   const [caps, setCaps] = useState<Capabilities | null>(null)
   const [serviceError, setServiceError] = useState('')
   const [checking, setChecking] = useState(true)
+  const [warmingTimedOut, setWarmingTimedOut] = useState(false)
   const [retry, setRetry] = useState(0)
   const [file, setFile] = useState<File | null>(null)
   const [source, setSource] = useState('')
@@ -33,11 +47,47 @@ export default function App() {
   const selection = useRef(0)
   const picker = useRef<HTMLInputElement>(null)
   const busy = ['uploading', 'queued', 'transcribing', 'rendering'].includes(stage)
+  const engine = caps?.engine
+  const warming = isEngineWarming(engine) && !warmingTimedOut
+  const warmingExpired = isEngineWarming(engine) && warmingTimedOut
+  const engineFailed = isEngineFailed(engine)
+  const engineBlocked = engine?.available === false
   useEffect(() => {
     const controller = new AbortController()
-    setChecking(true); setServiceError('')
-    capabilities(controller.signal).then(setCaps).catch(e => { if (!controller.signal.aborted) setServiceError(friendlyError(e)) }).finally(() => { if (!controller.signal.aborted) setChecking(false) })
-    return () => controller.abort()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let cancelled = false
+    const started = Date.now()
+    let delay = WARM_POLL_FIRST_MS
+    setChecking(true); setServiceError(''); setWarmingTimedOut(false)
+    async function load() {
+      if (cancelled || controller.signal.aborted) return
+      try {
+        const result = await capabilities(controller.signal)
+        if (cancelled || controller.signal.aborted) return
+        if (isEngineWarming(result.engine)) {
+          setCaps(result)
+          setChecking(false)
+          if (Date.now() - started > WARM_POLL_BUDGET_MS) {
+            setWarmingTimedOut(true)
+            return
+          }
+          timer = setTimeout(load, delay)
+          delay = Math.min(WARM_POLL_MAX_MS, Math.round(delay * 1.5))
+          return
+        }
+        setCaps(result)
+        setChecking(false)
+      } catch (e) {
+        if (cancelled || controller.signal.aborted) return
+        // Fetch/validation failures are terminal for this attempt; the user
+        // retries manually. Only warm-up (above) polls automatically.
+        if (e instanceof DOMException && e.name === 'AbortError') return
+        setServiceError(friendlyError(e))
+        setChecking(false)
+      }
+    }
+    load()
+    return () => { cancelled = true; controller.abort(); if (timer) clearTimeout(timer) }
   }, [retry])
   useEffect(() => {
     if (!file) { setSource(''); return }
@@ -47,7 +97,7 @@ export default function App() {
   }, [file])
   useEffect(() => () => operation.current?.abort(), [])
   async function select(files: File[]) {
-    if (busy || !caps) return
+    if (busy || !caps || engineBlocked) return
     const token = ++selection.current
     if (files.length !== 1) { setError('Please choose one recording at a time.'); return }
     const issue = validateFile(files[0], caps)
@@ -65,7 +115,7 @@ export default function App() {
     setFile(files[0]); setError(''); setResult(null); setXml(''); setStage('selected'); setProgress(undefined)
   }
   async function transcribe() {
-    if (!file || !caps || busy) return
+    if (!file || !caps || busy || engineBlocked) return
     operation.current?.abort()
     const controller = new AbortController()
     operation.current = controller
@@ -102,17 +152,20 @@ export default function App() {
       <section className="intro"><p className="eyebrow">YOUR MUSIC, IN WRITING</p><h1>Turn recordings into<br /> readable sheet music.</h1><p>Give a melody a place on the page.<br />Upload a recording, follow its transcription, and take your score with you.</p></section>
       <div className="workspace">
         <section className="upload-section" aria-labelledby="upload-title"><div className="section-heading"><span className="section-number">01</span><h2 id="upload-title">Start with a recording</h2></div>
-          {checking && <p className="service-note" role="status">Checking available audio formats…</p>}
+          {checking && !warming && <p className="service-note" role="status">Checking available audio formats…</p>}
           {serviceError && <div className="notice" role="alert"><strong>Transcription isn’t connected yet</strong><p>{serviceError} No recording has been uploaded.</p><button onClick={() => setRetry(n => n + 1)}>Check connection</button></div>}
-          {!serviceError && caps?.engine?.mock && <div className="notice" role="note"><strong>Demo engine active</strong><p>The backend is running its MOCK test engine: results are synthetic fixture data, not a real transcription.</p></div>}
-          <div className={`drop-zone ${dragging ? 'dragging' : ''}`} onDragOver={e => { e.preventDefault(); if (caps && !busy) setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={e => { e.preventDefault(); setDragging(false); select(Array.from(e.dataTransfer.files)) }}>
+          {!serviceError && warming && <div className="notice warming-notice" role="status"><strong>Transcription engine is warming up<span className="warming-ellipsis" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span></strong><p>Transcription engine is warming up — this can take up to a minute on first start. Your uploads will unlock automatically, no need to reload.</p></div>}
+          {!serviceError && warmingExpired && <div className="notice" role="status"><strong>Still warming up</strong><p>Transcription engine is still warming up — try reloading the page.</p><button onClick={() => setRetry(n => n + 1)}>Check connection</button></div>}
+          {!serviceError && engineFailed && <div className="notice" role="alert"><strong>Transcription isn’t available</strong><p>Transcription isn’t available: {typeof engine?.reason === 'string' && engine.reason ? engine.reason : 'The transcription service is unavailable.'}{typeof engine?.code === 'string' && engine.code && KNOWN_ENGINE_CODES.includes(engine.code) ? ` (${engine.code})` : ''}</p><button onClick={() => setRetry(n => n + 1)}>Check connection</button></div>}
+          {!serviceError && !engineBlocked && caps?.engine?.mock && <div className="notice" role="note"><strong>Demo engine active</strong><p>The backend is running its MOCK test engine: results are synthetic fixture data, not a real transcription.</p></div>}
+          <div className={`drop-zone ${dragging ? 'dragging' : ''}`} onDragOver={e => { e.preventDefault(); if (caps && !engineBlocked && !busy) setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={e => { e.preventDefault(); setDragging(false); select(Array.from(e.dataTransfer.files)) }}>
             <span className="upload-symbol" aria-hidden="true">↑</span><h3>{file ? file.name : 'Let your music begin here'}</h3><p>{file ? `${(file.size / 1024 / 1024).toFixed(1)} MB` : 'Drag a recording into this space'}</p>
-            <input ref={picker} className="sr-only" type="file" aria-label="Choose audio recording" accept={caps?.formats.map(f => `.${f}`).join(',') ?? '.mp3,.wav,.flac'} disabled={!caps || busy} onChange={e => { if (e.target.files?.length) select(Array.from(e.target.files)); e.target.value = '' }} />
-            <button onClick={() => picker.current?.click()} disabled={!caps || busy}>{file ? 'Choose another file' : 'Choose a recording'}</button>
+            <input ref={picker} className="sr-only" type="file" aria-label="Choose audio recording" accept={caps?.formats.map(f => `.${f}`).join(',') ?? '.mp3,.wav,.flac'} disabled={!caps || engineBlocked || busy} onChange={e => { if (e.target.files?.length) select(Array.from(e.target.files)); e.target.value = '' }} />
+            <button onClick={() => picker.current?.click()} disabled={!caps || engineBlocked || busy}>{file ? 'Choose another file' : 'Choose a recording'}</button>
             <small>{caps ? `${caps.formats.map(f => f.toUpperCase()).join(' · ')} · Up to ${Math.floor(caps.maxUploadBytes / 1024 / 1024)} MB` : 'Supported formats will appear when the service connects.'}</small>
           </div>
           <p className="upload-help">For a clearer score, try a clean recording with one prominent melody. Review the transcription before performing.</p>
-          <div className="upload-actions"><button className="primary" disabled={!file || busy || !caps} onClick={transcribe}>{stage === 'error' ? 'Try transcription again' : 'Create sheet music'}<span aria-hidden="true"> →</span></button>{busy && stage !== 'rendering' && <button onClick={stop}>Stop waiting</button>}</div>
+          <div className="upload-actions"><button className="primary" disabled={!file || busy || !caps || engineBlocked} onClick={transcribe}>{stage === 'error' ? 'Try transcription again' : 'Create sheet music'}<span aria-hidden="true"> →</span></button>{busy && stage !== 'rendering' && <button onClick={stop}>Stop waiting</button>}</div>
           <div className={`status ${stage}`} role="status" aria-live="polite"><span className="status-dot" /><span>{labels[stage]}{progress !== undefined && busy ? ` · ${progress}%` : ''}</span></div>
           {busy && <progress aria-label={labels[stage]} max="100" value={progress} />}
           {error && <p className="error-text" role="alert">{error}</p>}
