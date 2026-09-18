@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+# Secrets: backend/.env holds HF_TOKEN (root .gitignore also covers .env).
+.env
+.env.*
+!.env.example
+# Build / deps / caches (root .gitignore covers some of these; repeated here
+# so backend/ is safe when used as a standalone checkout).
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
