@@ -85,11 +85,13 @@ async function renderScore(xml: string) {
   let toolkit: VerovioToolkit | undefined
   try {
     toolkit = new VerovioToolkit(await modulePromise)
-    // `timemap` is what makes getElementsAtTime() available to the note
-    // highlighting pipeline. It does not change the engraving, and it costs
-    // nothing while the feature flag is off because the timemap is then never
-    // sampled (see buildTimeline call below).
-    toolkit.setOptions({ inputFrom: 'musicxml', pageWidth: 2100, pageHeight: 2970, scale: 40, adjustPageHeight: true, footer: 'none', svgView: 'score', timemap: true })
+    // Note highlighting reads live answers from getElementsAtTime(ms), which
+    // needs no render option: Verovio 6.3.0 has no `svgView` or `timemap`
+    // setOptions keys (both are reported as unsupported), and
+    // renderToTimemap() entries carry onset timing only ({ on/off, qstamp,
+    // tstamp, tempo }) — never note ids. Sampling happens solely through
+    // buildTimeline below, and only while the feature flag is on.
+    toolkit.setOptions({ inputFrom: 'musicxml', pageWidth: 2100, pageHeight: 2970, scale: 40, adjustPageHeight: true, footer: 'none' })
     if (!toolkit.loadData(xml) || !toolkit.getPageCount()) throw new ScoreRejected('Verovio rejected the score')
     const pages = Array.from({ length: toolkit.getPageCount() }, (_, i) => DOMPurify.sanitize(toolkit!.renderToSVG(i + 1), { USE_PROFILES: { svg: true, svgFilters: true } }))
     const timeline = ENABLE_NOTE_HIGHLIGHTING ? buildTimeline(toolkit) : []
