@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { capabilities, cancelJob, friendlyError, getJob, getMusicXML, probeDurationSec, upload, validateDuration, validateFile, ServiceError } from './api'
 import type { Capabilities, EngineInfo, Result } from './api'
-import ScoreViewer from './ScoreViewer'
+import ScoreViewer, { activeNoteAt } from './ScoreViewer'
+import type { NoteSpan } from './ScoreViewer'
 import Playback from './Playback'
+import { ENABLE_NOTE_HIGHLIGHTING } from './config'
 import './App.css'
 
 export const WARM_POLL_FIRST_MS = 2000
@@ -45,6 +47,11 @@ export default function App() {
   // True when the transcription itself succeeded but Verovio could not draw
   // the score. Kept separate from `error` so the page stays usable.
   const [scoreFailed, setScoreFailed] = useState(false)
+  // Note-following state. Only ever populated when ENABLE_NOTE_HIGHLIGHTING
+  // (config.ts) is true — see the gate on activeNoteId below.
+  const [spans, setSpans] = useState<NoteSpan[]>([])
+  const [timeMs, setTimeMs] = useState(0)
+  const [highlightedNote, setHighlightedNote] = useState<string | null>(null)
   const operation = useRef<AbortController | null>(null)
   const jobId = useRef<string | null>(null)
   const selection = useRef(0)
@@ -145,8 +152,14 @@ export default function App() {
   // the MIDI/MusicXML downloads above still work, so the page stays at
   // 'complete' and only the on-screen engraving is reported as unavailable.
   const handleRenderFailure = useCallback(() => { setScoreFailed(true); setStage('complete') }, [])
-  // A new score clears the previous notation failure.
-  useEffect(() => { setScoreFailed(false) }, [xml])
+  const handleTimelineChange = useCallback((next: NoteSpan[]) => setSpans(next), [])
+  const handleNoteHighlight = useCallback((noteId: string | null) => setHighlightedNote(noteId), [])
+  // A new score clears the previous notation failure and any old timeline.
+  useEffect(() => { setScoreFailed(false); setSpans([]); setTimeMs(0) }, [xml])
+  // The highlighted note is derived from the score's own timemap plus the
+  // audio clock. While ENABLE_NOTE_HIGHLIGHTING is false this is always null,
+  // so nothing is highlighted and the audio clock is never even read.
+  const activeNoteId = ENABLE_NOTE_HIGHLIGHTING ? activeNoteAt(spans, timeMs) : null
   function stop() {
     operation.current?.abort()
     const id = jobId.current
@@ -181,8 +194,9 @@ export default function App() {
           <aside className="process-note"><span aria-hidden="true">✧</span><div><h3>From sound to score</h3><p>MuScriptor transcribes your audio. Real MusicXML becomes staff notation, ready to read and export.</p></div></aside>
         </section>
         <section className="manuscript" aria-labelledby="score-title" aria-busy={stage === 'rendering'}><div className="section-heading manuscript-heading"><span className="section-number">02</span><h2 id="score-title">Your manuscript</h2>{stage === 'complete' && !scoreFailed && <span className="ready-badge">Ready to read</span>}</div>
-          {xml ? <ScoreViewer xml={xml} onReady={ready} onRenderFailure={handleRenderFailure} /> : <div className="empty-score"><span className="manuscript-seal" aria-hidden="true">♫</span><p className="eyebrow">A LITTLE SPACE FOR YOUR NEXT MELODY</p><h3>{stage === 'rendering' ? 'Preparing your manuscript…' : 'Your score starts with a sound.'}</h3><p>Once your recording is transcribed,<br />your sheet music will appear here.</p><div className="empty-divider" /><small>Staff notation · Playback · MIDI & MusicXML</small></div>}
-          {result && <><div className="exports"><div><h3>Keep making music</h3><p>Open your score in your favourite music editor.</p></div><div className="export-buttons"><a className="button" href={result.midiUrl} download="transcription.mid">↓ Download MIDI</a><a className="button" href={result.musicxmlUrl} download="transcription.musicxml">↓ Download MusicXML</a></div></div>{(result.audioUrl || source) && <Playback src={result.audioUrl || source} generated={!!result.audioUrl} />}</>}
+          {ENABLE_NOTE_HIGHLIGHTING && highlightedNote && <p className="sr-only" aria-live="polite">Following the highlighted note.</p>}
+          {xml ? <ScoreViewer xml={xml} onReady={ready} onRenderFailure={handleRenderFailure} activeNoteId={activeNoteId} onNoteHighlight={handleNoteHighlight} onTimelineChange={handleTimelineChange} /> : <div className="empty-score"><span className="manuscript-seal" aria-hidden="true">♫</span><p className="eyebrow">A LITTLE SPACE FOR YOUR NEXT MELODY</p><h3>{stage === 'rendering' ? 'Preparing your manuscript…' : 'Your score starts with a sound.'}</h3><p>Once your recording is transcribed,<br />your sheet music will appear here.</p><div className="empty-divider" /><small>Staff notation · Playback · MIDI & MusicXML</small></div>}
+          {result && <><div className="exports"><div><h3>Keep making music</h3><p>Open your score in your favourite music editor.</p></div><div className="export-buttons"><a className="button" href={result.midiUrl} download="transcription.mid">↓ Download MIDI</a><a className="button" href={result.musicxmlUrl} download="transcription.musicxml">↓ Download MusicXML</a></div></div>{(result.audioUrl || source) && <Playback src={result.audioUrl || source} generated={!!result.audioUrl} onTimeMs={ENABLE_NOTE_HIGHLIGHTING ? setTimeMs : undefined} />}</>}
         </section>
       </div>
     </main>
