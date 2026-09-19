@@ -127,6 +127,9 @@ export default function ScoreViewer({ xml, onReady, onRenderFailure, activeNoteI
         // A failure to engrave must not take over the whole page: it is
         // reported here, next to the manuscript, and the downloads stay live.
         if (!active) return
+        // Keep the cause-free inline message for the user; the original
+        // error goes to the console for diagnosis, never to the UI.
+        console.error('ScoreViewer: the notation could not be rendered.', error)
         const code: RenderFailureCode = error instanceof ScoreRejected ? 'verovio-score-rejected' : 'verovio-init-failed'
         setFailure(code)
         onRenderFailure(code)
