@@ -42,6 +42,9 @@ export default function App() {
   const [result, setResult] = useState<Result | null>(null)
   const [xml, setXml] = useState('')
   const [dragging, setDragging] = useState(false)
+  // True when the transcription itself succeeded but Verovio could not draw
+  // the score. Kept separate from `error` so the page stays usable.
+  const [scoreFailed, setScoreFailed] = useState(false)
   const operation = useRef<AbortController | null>(null)
   const jobId = useRef<string | null>(null)
   const selection = useRef(0)
@@ -137,7 +140,13 @@ export default function App() {
     } catch (e) { if (!controller.signal.aborted) { setStage('error'); setError(friendlyError(e)) } }
   }
   const ready = useCallback(() => setStage('complete'), [])
-  const renderError = useCallback(() => { setStage('error'); setError('The notation could not be displayed. You can still download your files below.') }, [])
+  // A notation failure is surfaced inside the manuscript panel by ScoreViewer.
+  // It must NOT become the page-level error: the transcription completed and
+  // the MIDI/MusicXML downloads above still work, so the page stays at
+  // 'complete' and only the on-screen engraving is reported as unavailable.
+  const handleRenderFailure = useCallback(() => { setScoreFailed(true); setStage('complete') }, [])
+  // A new score clears the previous notation failure.
+  useEffect(() => { setScoreFailed(false) }, [xml])
   function stop() {
     operation.current?.abort()
     const id = jobId.current
@@ -171,8 +180,8 @@ export default function App() {
           {error && <p className="error-text" role="alert">{error}</p>}
           <aside className="process-note"><span aria-hidden="true">✧</span><div><h3>From sound to score</h3><p>MuScriptor transcribes your audio. Real MusicXML becomes staff notation, ready to read and export.</p></div></aside>
         </section>
-        <section className="manuscript" aria-labelledby="score-title" aria-busy={stage === 'rendering'}><div className="section-heading manuscript-heading"><span className="section-number">02</span><h2 id="score-title">Your manuscript</h2>{stage === 'complete' && <span className="ready-badge">Ready to read</span>}</div>
-          {xml ? <ScoreViewer xml={xml} onReady={ready} onError={renderError} /> : <div className="empty-score"><span className="manuscript-seal" aria-hidden="true">♫</span><p className="eyebrow">A LITTLE SPACE FOR YOUR NEXT MELODY</p><h3>{stage === 'rendering' ? 'Preparing your manuscript…' : 'Your score starts with a sound.'}</h3><p>Once your recording is transcribed,<br />your sheet music will appear here.</p><div className="empty-divider" /><small>Staff notation · Playback · MIDI & MusicXML</small></div>}
+        <section className="manuscript" aria-labelledby="score-title" aria-busy={stage === 'rendering'}><div className="section-heading manuscript-heading"><span className="section-number">02</span><h2 id="score-title">Your manuscript</h2>{stage === 'complete' && !scoreFailed && <span className="ready-badge">Ready to read</span>}</div>
+          {xml ? <ScoreViewer xml={xml} onReady={ready} onRenderFailure={handleRenderFailure} /> : <div className="empty-score"><span className="manuscript-seal" aria-hidden="true">♫</span><p className="eyebrow">A LITTLE SPACE FOR YOUR NEXT MELODY</p><h3>{stage === 'rendering' ? 'Preparing your manuscript…' : 'Your score starts with a sound.'}</h3><p>Once your recording is transcribed,<br />your sheet music will appear here.</p><div className="empty-divider" /><small>Staff notation · Playback · MIDI & MusicXML</small></div>}
           {result && <><div className="exports"><div><h3>Keep making music</h3><p>Open your score in your favourite music editor.</p></div><div className="export-buttons"><a className="button" href={result.midiUrl} download="transcription.mid">↓ Download MIDI</a><a className="button" href={result.musicxmlUrl} download="transcription.musicxml">↓ Download MusicXML</a></div></div>{(result.audioUrl || source) && <Playback src={result.audioUrl || source} generated={!!result.audioUrl} />}</>}
         </section>
       </div>
