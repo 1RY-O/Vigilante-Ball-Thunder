@@ -49,3 +49,63 @@ background warm-up keeps that state fresh.
   polling once `available === true`. Ignoring this is safe — no contract
   breakage, only a longer wait for the user.
 
+## 2026-09-18 — Findings from the deployed "notation could not be displayed" bug
+
+The backend owner reproduced the deployed pipeline end-to-end (uploaded a WAV
+to https://vigilante-ball-thunder.onrender.com, downloaded the completed
+stub-engine artifact, ran it through Verovio 4.x wasm locally). Evidence
+backed conclusions; frontend fixes are requested, not implemented here.
+
+### 1. The deployed stub MusicXML is VALID — do not blame the engine
+
+The artifact served by `GET /api/artifacts/:id/musicxml` (Render, stub
+engine) **loads and renders correctly in Verovio**:
+
+```
+LOAD_DATA=1
+renderToSVG → 89801 chars of SVG, contains <g class="note" id="note-0000..">
+renderToTimemap → entries {on, qstamp, tempo, tstamp}
+getElementsAtTime(ms) → e.g. [ 'note-0000' ]
+```
+
+So "The notation could not be displayed" on Vercel is a **frontend Verovio
+usage bug**, not bad backend output.
+
+### 2. `setOptions({ svgView: 'score', timemap: true })` does not exist
+
+Verovio logs `Unsupported option` for both keys — there is no `svgView` and
+no `timemap` render option. The real API is:
+
+```js
+tk.loadData(musicxmlString);
+tk.renderToSVG();          // page SVG
+const timemap = tk.renderToTimemap();   // array, NOT a setOptions flag
+const idsAtMs  = tk.getElementsAtTime(ms); // ['note-0000', ...] | []
+```
+(Requested in the feature ticket as `tk.setOptions({..., timemap:true})` +
+`tk.getElementsAtTime(...)` — keep `getElementsAtTime`, drop the setOptions.)
+
+### 3. Timemap entries have NO `notes` arrays in this build
+
+Each entry is `{ on, qstamp, tempo?, tstamp }`. Any code reading
+`entry.notes` to get active note ids always gets `undefined` → highlighting
+silently never fires. Use `tk.getElementsAtTime(ms)` per animation frame
+instead (it accepts milliseconds directly; no manual tempo/qstamp math
+needed).
+
+### 4. Proposed user-facing copy is factually wrong — please change it
+
+The planned catch-all message ("This is a known issue with the mock engine.
+Please try the local backend for real transcription.") is **false**: the
+mock engine's score demonstrably renders (finding 1). Per the project's
+no-fabrication rule, on a Verovio exception show something honest and
+actionable, e.g. "The score could not be displayed. Please try again." plus
+`console.error(originalError)` for diagnosis — and keep it out of the
+top-level error state, as planned.
+
+### 5. (already recorded above) poll capabilities while `engine.checking`
+Render's free tier sleeps instances; the very first capabilities response
+after a cold boot can legitimately be `engine-warming-up` for ~1 tick. A
+mount-time single fetch turns that into a hard error for the user.
+
+
