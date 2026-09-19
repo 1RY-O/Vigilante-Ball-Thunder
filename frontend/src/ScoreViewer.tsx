@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import DOMPurify from 'dompurify'
-import type { VerovioToolkit } from 'verovio/esm'
+import type { VerovioTimemap, VerovioToolkit } from 'verovio/esm'
+import { ENABLE_NOTE_HIGHLIGHTING } from './config'
 
 /**
  * Why the on-screen notation is missing. Reported so callers can log or
@@ -20,6 +21,60 @@ export type RenderFailureCode = 'verovio-score-rejected' | 'verovio-init-failed'
  */
 export const SCORE_RENDER_ERROR_TEXT = 'The notation could not be displayed for this recording. You can still download your files below.'
 
+/** One stretch of time during which a single note is sounding. */
+export interface NoteSpan { id: string; startMs: number; endMs: number }
+
+/** Sampling step used to turn Verovio's timemap into note spans. */
+export const TIMEMAP_STEP_MS = 50
+/** Safety cap, so a pathological score cannot make the scan run forever. */
+export const TIMEMAP_MAX_MS = 20 * 60 * 1000
+
+/**
+ * The note sounding at `timeMs`, or null during a gap/rest. Spans are ordered
+ * and contiguous, so this is a binary search for the last span that started.
+ */
+export function activeNoteAt(spans: readonly NoteSpan[], timeMs: number): string | null {
+  let low = 0
+  let high = spans.length - 1
+  let found = -1
+  while (low <= high) {
+    const mid = (low + high) >> 1
+    const span = spans[mid]!
+    if (span.startMs <= timeMs) { found = mid; low = mid + 1 } else high = mid - 1
+  }
+  const span = found >= 0 ? spans[found] : undefined
+  return span && timeMs < span.endMs ? span.id : null
+}
+
+/** True when the span already open is the note sounding at this sample. */
+function isContinuing(open: NoteSpan | null, id: string): open is NoteSpan {
+  return open?.id === id
+}
+
+/**
+ * Walk Verovio's timemap and record when each note starts and stops.
+ *
+ * Verovio is the only source of truth: every span comes from a real
+ * getElementsAtTime answer, nothing is interpolated or invented, and the scan
+ * stops as soon as the timemap reports nothing at all (past the score's end).
+ */
+export function buildTimeline(toolkit: VerovioToolkit): NoteSpan[] {
+  const spans: NoteSpan[] = []
+  let open: NoteSpan | null = null
+  for (let ms = 0; ms <= TIMEMAP_MAX_MS; ms += TIMEMAP_STEP_MS) {
+    const elements: VerovioTimemap = toolkit.getElementsAtTime(ms)
+    const notes = elements?.notes ?? []
+    const rests = elements?.rests ?? []
+    if (!notes.length && !rests.length && !elements?.measure) break
+    const id = notes[0] ?? null
+    if (!id) { open = null; continue }
+    if (isContinuing(open, id)) { open.endMs = ms + TIMEMAP_STEP_MS; continue }
+    open = { id, startMs: ms, endMs: ms + TIMEMAP_STEP_MS }
+    spans.push(open)
+  }
+  return spans
+}
+
 /** Thrown when Verovio itself refuses the score (as opposed to failing to start). */
 class ScoreRejected extends Error {}
 
@@ -30,20 +85,42 @@ async function renderScore(xml: string) {
   let toolkit: VerovioToolkit | undefined
   try {
     toolkit = new VerovioToolkit(await modulePromise)
-    toolkit.setOptions({ inputFrom: 'musicxml', pageWidth: 2100, pageHeight: 2970, scale: 40, adjustPageHeight: true, footer: 'none' })
+    // `timemap` is what makes getElementsAtTime() available to the note
+    // highlighting pipeline. It does not change the engraving, and it costs
+    // nothing while the feature flag is off because the timemap is then never
+    // sampled (see buildTimeline call below).
+    toolkit.setOptions({ inputFrom: 'musicxml', pageWidth: 2100, pageHeight: 2970, scale: 40, adjustPageHeight: true, footer: 'none', svgView: 'score', timemap: true })
     if (!toolkit.loadData(xml) || !toolkit.getPageCount()) throw new ScoreRejected('Verovio rejected the score')
-    return Array.from({ length: toolkit.getPageCount() }, (_, i) => DOMPurify.sanitize(toolkit!.renderToSVG(i + 1), { USE_PROFILES: { svg: true, svgFilters: true } }))
+    const pages = Array.from({ length: toolkit.getPageCount() }, (_, i) => DOMPurify.sanitize(toolkit!.renderToSVG(i + 1), { USE_PROFILES: { svg: true, svgFilters: true } }))
+    const timeline = ENABLE_NOTE_HIGHLIGHTING ? buildTimeline(toolkit) : []
+    return { pages, timeline }
   } finally { toolkit?.destroy() }
 }
-export default function ScoreViewer({ xml, onReady, onRenderFailure }: { xml: string; onReady: () => void; onRenderFailure: (code: RenderFailureCode) => void }) {
+export default function ScoreViewer({ xml, onReady, onRenderFailure, activeNoteId, onNoteHighlight, onTimelineChange }: {
+  xml: string
+  onReady: () => void
+  onRenderFailure: (code: RenderFailureCode) => void
+  /** Note to highlight, computed by the parent from the timemap + audio time. */
+  activeNoteId?: string | null
+  /** Fires when the highlighted note changes (a note boundary was crossed). */
+  onNoteHighlight?: (noteId: string | null) => void
+  /** Publishes the note timeline (id <-> ms) after a successful engraving. */
+  onTimelineChange?: (spans: NoteSpan[]) => void
+}) {
   const [pages, setPages] = useState<string[]>([])
   const [failure, setFailure] = useState<RenderFailureCode | null>(null)
   const [zoom, setZoom] = useState(100)
+  const scroll = useRef<HTMLDivElement>(null)
   useEffect(() => {
     let active = true
     setPages([]); setFailure(null)
     renderScore(xml)
-      .then(result => { if (active) { setPages(result); onReady() } })
+      .then(result => {
+        if (!active) return
+        setPages(result.pages)
+        onTimelineChange?.(result.timeline)
+        onReady()
+      })
       .catch((error: unknown) => {
         // A failure to engrave must not take over the whole page: it is
         // reported here, next to the manuscript, and the downloads stay live.
@@ -53,10 +130,30 @@ export default function ScoreViewer({ xml, onReady, onRenderFailure }: { xml: st
         onRenderFailure(code)
       })
     return () => { active = false }
-  }, [xml, onReady, onRenderFailure])
+  }, [xml, onReady, onRenderFailure, onTimelineChange])
+
+  // Note highlighting is DORMANT until ENABLE_NOTE_HIGHLIGHTING is true. With
+  // the flag off both effects below return before touching anything, so no
+  // class is ever applied and no highlight event is ever emitted.
+  useEffect(() => {
+    if (!ENABLE_NOTE_HIGHLIGHTING) return
+    onNoteHighlight?.(activeNoteId ?? null)
+  }, [activeNoteId, onNoteHighlight])
+
+  useEffect(() => {
+    if (!ENABLE_NOTE_HIGHLIGHTING) return
+    const root = scroll.current
+    if (!root) return
+    const notes = Array.from(root.querySelectorAll<SVGGElement>('g.note'))
+    // Match on the element id itself rather than a selector, so no id value
+    // can ever be interpreted as CSS.
+    const next = activeNoteId ? notes.find(note => note.id === activeNoteId) ?? null : null
+    for (const note of notes) if (note !== next) note.classList.remove('playing')
+    next?.classList.add('playing')
+  }, [activeNoteId, pages])
   return <>
     <div className="score-tools"><span>{pages.length ? `${pages.length} ${pages.length === 1 ? 'page' : 'pages'} · MusicXML notation` : failure ? 'Notation unavailable' : 'Engraving your manuscript…'}</span><div className="zoom"><button aria-label="Zoom out" disabled={zoom <= 60} onClick={() => setZoom(z => z - 10)}>−</button><output aria-label="Zoom level">{zoom}%</output><button aria-label="Zoom in" disabled={zoom >= 160} onClick={() => setZoom(z => z + 10)}>+</button></div></div>
-    <div className="score-scroll" tabIndex={0} aria-label="Sheet music pages">
+    <div className="score-scroll" ref={scroll} tabIndex={0} aria-label="Sheet music pages">
       {failure && <p className="score-error" role="alert" data-render-failure={failure}>{SCORE_RENDER_ERROR_TEXT}</p>}
       {pages.map((svg, i) => <div className="score-page" key={i} style={{ width: `${840 * zoom / 100}px` }} role="img" aria-label={`Sheet music, page ${i + 1}`} dangerouslySetInnerHTML={{ __html: svg }} />)}
     </div>
