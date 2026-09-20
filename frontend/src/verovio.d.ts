@@ -17,20 +17,6 @@ declare module 'verovio/esm' {
     measure?: string
     page?: number
   }
-  /**
-   * One entry of the full map returned by renderToTimemap() (verovio 6.3.0,
-   * same probe: entries are e.g. { on: ["…"], qstamp: 0, tempo: 96,
-   * tstamp: 0 } or { off: ["…"], on: ["…"], qstamp: 1, tstamp: 625 }).
-   * Entries carry onset timing only — there is NO `notes` array on them.
-   * Per-frame note ids come from getElementsAtTime(ms).notes instead.
-   */
-  export interface VerovioTimemapEntry {
-    on?: string[]
-    off?: string[]
-    qstamp: number
-    tstamp: number
-    tempo?: number
-  }
   export class VerovioToolkit {
     constructor(module: unknown)
     setOptions(options: Record<string, unknown>): boolean

@@ -5,7 +5,7 @@
  */
 
 export const INSTRUMENT_OPTIONS = [
-  { value: 'auto', label: 'Auto-detect', hint: 'Let the engine try without hints.' },
+  { value: 'auto', label: 'Auto-detect' },
   { value: 'piano', label: 'Piano / keyboard' },
   { value: 'guitar', label: 'Guitar' },
   { value: 'bass', label: 'Bass' },
