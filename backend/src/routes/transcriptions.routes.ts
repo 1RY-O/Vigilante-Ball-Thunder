@@ -217,6 +217,16 @@ export function buildArtifactsRouter(ctx: AppContext): Router {
           return;
         }
       }
+      // Heavy, billable operation: re-check the dependency right now instead of
+      // trusting a cached probe, so a soundfont added/removed since the last
+      // capabilities poll is reflected honestly.
+      const availability = await ctx.playback.probe(true);
+      if (!availability.available) {
+        throw new PlaybackUnavailableError(
+          availability.reason ?? 'Audio playback is unavailable on this deployment.',
+          availability.code ?? 'fluidsynth-missing',
+        );
+      }
       const wavPath = path.join(job.workDir, 'playback.wav');
       const durationSec = await ctx.playback.renderMidiToWav(job.midiPath, wavPath);
       ctx.jobManager.recordPlayback(job.id, wavPath);
