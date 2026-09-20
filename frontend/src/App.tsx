@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { capabilities, cancelJob, friendlyError, getJob, getMusicXML, probeDurationSec, upload, validateDuration, validateFile, ServiceError } from './api'
+import { capabilities, cancelJob, friendlyError, generatePlayback, getJob, getMusicXML, probeDurationSec, upload, validateDuration, validateFile, ServiceError } from './api'
 import type { Capabilities, EngineInfo, Result } from './api'
 import ScoreViewer, { activeNoteAt } from './ScoreViewer'
 import type { NoteSpan } from './ScoreViewer'
 import Playback from './Playback'
-import { ENABLE_NOTE_HIGHLIGHTING } from './config'
+import { ENABLE_NOTE_HIGHLIGHTING, PLAYBACK_GENERATION_ENABLED } from './config'
+import { DEFAULT_INSTRUMENT, DEFAULT_SHEET_TYPE, INSTRUMENT_OPTIONS, INSTRUMENT_OTHER, SHEET_TYPE_OPTIONS, SHEET_TYPE_SUPPORTED } from './options'
+import type { InstrumentValue, SheetTypeValue } from './options'
+import { formatBytes, formatDurationSec } from './format'
 import './App.css'
 
 export const WARM_POLL_FIRST_MS = 2000
@@ -52,6 +55,17 @@ export default function App() {
   const [spans, setSpans] = useState<NoteSpan[]>([])
   const [timeMs, setTimeMs] = useState(0)
   const [highlightedNote, setHighlightedNote] = useState<string | null>(null)
+  const [instrument, setInstrument] = useState<InstrumentValue>(DEFAULT_INSTRUMENT)
+  const [instrumentDetail, setInstrumentDetail] = useState('')
+  const [sheetType, setSheetType] = useState<SheetTypeValue>(DEFAULT_SHEET_TYPE)
+  // A selected-but-blocked file (larger or longer than the service allows).
+  // Kept separate from `error` so the file card can stay visible with the
+  // exact limit and overflow shown before the user clicks "Create sheet music".
+  const [selectionIssue, setSelectionIssue] = useState('')
+  const [probedDuration, setProbedDuration] = useState<number | null>(null)
+  // Client-measured wall time for the metadata panel (upload → complete).
+  const [transcriptionMs, setTranscriptionMs] = useState<number | null>(null)
+  const [generatingPlayback, setGeneratingPlayback] = useState(false)
   const operation = useRef<AbortController | null>(null)
   const jobId = useRef<string | null>(null)
   const selection = useRef(0)
@@ -62,6 +76,13 @@ export default function App() {
   const warmingExpired = isEngineWarming(engine) && warmingTimedOut
   const engineFailed = isEngineFailed(engine)
   const engineBlocked = engine?.available === false
+  // True when the pressed file is over a limit: the file stays listed so its
+  // size/duration and the exact overflow are visible, but upload is disabled.
+  const instrumentBlocked = !!selectionIssue
+  // Metadata panel values, all sourced from what the backend actually returns
+  // (capabilities) or from measurements of the user's own upload — never invented.
+  const metadataEngine = caps?.engine ? (caps.engine.mock ? `${caps.engine.name ?? 'stub'} (MOCK)` : caps.engine.name ?? null) : null
+  const metadataModel = caps?.engine?.model
   useEffect(() => {
     const controller = new AbortController()
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -110,41 +131,60 @@ export default function App() {
     if (busy || !caps || engineBlocked) return
     const token = ++selection.current
     if (files.length !== 1) { setError('Please choose one recording at a time.'); return }
-    const issue = validateFile(files[0], caps)
-    if (issue) { setError(issue); return }
-    // Best-effort duration gate, only when the service advertises a limit
-    // (browsers that cannot decode the file return null; the backend still
-    // enforces duration independently).
-    if (caps.maxAudioDurationSec) {
-      const duration = await probeDurationSec(files[0])
-      if (token !== selection.current) return
-      const tooLong = validateDuration(duration, caps)
-      if (tooLong) { setError(tooLong); return }
-    }
+    const file = files[0]
+    const issue = validateFile(file, caps)
+    const oversized = file.size > caps.maxUploadBytes
+    // Format/empty problems reject the file outright. An oversized file stays
+    // SELECTED so the exact limit and overflow are shown next to it, and the
+    // "Create sheet music" button stays disabled until a fitting file is chosen.
+    if (issue && !oversized) { setSelectionIssue(''); setError(issue); return }
+    const duration = caps.maxAudioDurationSec ? await probeDurationSec(file) : null
+    if (token !== selection.current) return
+    setProbedDuration(duration)
+    const durationIssue = validateDuration(duration, caps)
+    const block = durationIssue ?? (oversized ? issue : null)
+    setSelectionIssue(block ?? '')
+    setError(block ?? '')
     operation.current?.abort()
-    setFile(files[0]); setError(''); setResult(null); setXml(''); setStage('selected'); setProgress(undefined)
+    setFile(file); setResult(null); setXml(''); setStage('selected'); setProgress(undefined)
   }
   async function transcribe() {
-    if (!file || !caps || busy || engineBlocked) return
+    if (!file || !caps || busy || engineBlocked || selectionIssue) return
     operation.current?.abort()
     const controller = new AbortController()
     operation.current = controller
     setError(''); setResult(null); setXml(''); setStage('uploading'); setProgress(undefined)
+    const started = performance.now()
     try {
-      let job = await upload(file, controller.signal, setProgress)
+      let job = await upload(file, controller.signal, setProgress, {
+        instrument,
+        // Free text only travels when the user actually picked "Other".
+        instrumentDetail: instrument === INSTRUMENT_OTHER && instrumentDetail.trim() ? instrumentDetail.trim() : undefined,
+      })
       jobId.current = job.id
-      const started = Date.now()
+      const jobStarted = Date.now()
       while (job.status === 'queued' || job.status === 'transcribing') {
         setStage(job.status); setProgress(job.progress)
-        if (Date.now() - started > 30 * 60 * 1000) throw new ServiceError('This transcription is taking longer than expected. We stopped checking; the service may still be processing it.')
+        if (Date.now() - jobStarted > 30 * 60 * 1000) throw new ServiceError('This transcription is taking longer than expected. We stopped checking; the service may still be processing it.')
         await wait(controller.signal)
         job = await getJob(job.id, controller.signal)
       }
       if (job.status === 'error' || !job.result) throw new ServiceError(job.error?.message ?? 'Transcription could not be completed. Try a shorter, clearer recording in a supported format.')
-      setResult(job.result); setStage('rendering'); setProgress(undefined)
+      setResult(job.result); setStage('rendering'); setProgress(undefined); setTranscriptionMs(Math.round(performance.now() - started))
       const notation = await getMusicXML(job.result.musicxmlUrl, controller.signal)
       if (!controller.signal.aborted) setXml(notation)
     } catch (e) { if (!controller.signal.aborted) { setStage('error'); setError(friendlyError(e)) } }
+  }
+  // Score-aligned playback generation. Reachable only while
+  // PLAYBACK_GENERATION_ENABLED is true (otherwise the button is hidden), so
+  // this wiring is dormant until the backend implements the endpoint.
+  async function startGeneratedPlayback() {
+    if (!result || !jobId.current || generatingPlayback || result.audioUrl) return
+    setGeneratingPlayback(true); setError('')
+    try {
+      const url = await generatePlayback(jobId.current)
+      setResult(prev => (prev ? { ...prev, audioUrl: url } : prev))
+    } catch (e) { setError(friendlyError(e)) } finally { setGeneratingPlayback(false) }
   }
   const ready = useCallback(() => setStage('complete'), [])
   // A notation failure is surfaced inside the manuscript panel by ScoreViewer.
@@ -180,23 +220,45 @@ export default function App() {
           {!serviceError && warmingExpired && <div className="notice" role="status"><strong>Still warming up</strong><p>Transcription engine is still warming up — try reloading the page.</p><button onClick={() => setRetry(n => n + 1)}>Check connection</button></div>}
           {!serviceError && engineFailed && <div className="notice" role="alert"><strong>Transcription isn’t available</strong><p>Transcription isn’t available: {typeof engine?.reason === 'string' && engine.reason ? engine.reason : 'The transcription service is unavailable.'}{typeof engine?.code === 'string' && engine.code && KNOWN_ENGINE_CODES.includes(engine.code) ? ` (${engine.code})` : ''}</p><button onClick={() => setRetry(n => n + 1)}>Check connection</button></div>}
           {!serviceError && !engineBlocked && caps?.engine?.mock && <div className="notice" role="note"><strong>Demo engine active</strong><p>The backend is running its MOCK test engine: results are synthetic fixture data, not a real transcription.</p></div>}
+          <ol className="how-it-works" aria-label="How it works">
+            <li><strong>1. Upload a recording</strong><span>WAV, MP3, or FLAC, within the service limits.</span></li>
+            <li><strong>2. Choose your setup</strong><span>Pass an instrument hint to the transcription engine — or let it auto-detect.</span></li>
+            <li><strong>3. Transcribe &amp; review</strong><span>Follow the progress and keep your MusicXML and MIDI downloads.</span></li>
+          </ol>
           <div className={`drop-zone ${dragging ? 'dragging' : ''}`} onDragOver={e => { e.preventDefault(); if (caps && !engineBlocked && !busy) setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={e => { e.preventDefault(); setDragging(false); select(Array.from(e.dataTransfer.files)) }}>
-            <span className="upload-symbol" aria-hidden="true">↑</span><h3>{file ? file.name : 'Let your music begin here'}</h3><p>{file ? `${(file.size / 1024 / 1024).toFixed(1)} MB` : 'Drag a recording into this space'}</p>
+            <span className="upload-symbol" aria-hidden="true">↑</span><h3>{file ? file.name : 'Let your music begin here'}</h3>{file ? <div className="file-details"><span>Format {file.name.split('.').pop()?.toUpperCase() ?? '—'}</span><span>{formatBytes(file.size)}</span>{probedDuration != null && <span>{formatDurationSec(probedDuration)}</span>}</div> : <p>Drag a recording into this space</p>}
             <input ref={picker} className="sr-only" type="file" aria-label="Choose audio recording" accept={caps?.formats.map(f => `.${f}`).join(',') ?? '.mp3,.wav,.flac'} disabled={!caps || engineBlocked || busy} onChange={e => { if (e.target.files?.length) select(Array.from(e.target.files)); e.target.value = '' }} />
             <button onClick={() => picker.current?.click()} disabled={!caps || engineBlocked || busy}>{file ? 'Choose another file' : 'Choose a recording'}</button>
-            <small>{caps ? `${caps.formats.map(f => f.toUpperCase()).join(' · ')} · Up to ${Math.floor(caps.maxUploadBytes / 1024 / 1024)} MB` : 'Supported formats will appear when the service connects.'}</small>
+            <small>{caps ? `${caps.formats.map(f => f.toUpperCase()).join(' · ')} · Up to ${formatBytes(caps.maxUploadBytes)}` : 'Supported formats will appear when the service connects.'}</small>
+          </div>
+          <div className="transcription-options">
+            <fieldset className="option-field" disabled={!caps || engineBlocked || busy}>
+              <legend>Instrument</legend>
+              <select aria-label="Instrument" value={instrument} onChange={e => { setInstrument(e.target.value as InstrumentValue); if (e.target.value !== INSTRUMENT_OTHER) setInstrumentDetail('') }}>
+                {INSTRUMENT_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+              </select>
+              {instrument === INSTRUMENT_OTHER && <label className="instrument-detail">Describe the instrument<input type="text" value={instrumentDetail} maxLength={120} placeholder="e.g. saxophone solo" onChange={e => setInstrumentDetail(e.target.value)} /></label>}
+              <small className="option-hint">Sent to the transcription engine as a hint; Auto-detect sends no hint.</small>
+            </fieldset>
+            <fieldset className="option-field" aria-label="Sheet type" title="Coming soon">
+              <legend>Sheet type <span className="coming-soon">Coming soon</span></legend>
+              <select aria-label="Sheet type" value={sheetType} disabled={!SHEET_TYPE_SUPPORTED} onChange={e => setSheetType(e.target.value as SheetTypeValue)}>
+                {SHEET_TYPE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+              </select>
+              <small className="option-hint">Not available yet — the transcription backend does not accept sheet-type selection.</small>
+            </fieldset>
           </div>
           <p className="upload-help">For a clearer score, try a clean recording with one prominent melody. Review the transcription before performing.</p>
-          <div className="upload-actions"><button className="primary" disabled={!file || busy || !caps || engineBlocked} onClick={transcribe}>{stage === 'error' ? 'Try transcription again' : 'Create sheet music'}<span aria-hidden="true"> →</span></button>{busy && stage !== 'rendering' && <button onClick={stop}>Stop waiting</button>}</div>
+          <div className="upload-actions"><button className="primary" disabled={!file || busy || !caps || engineBlocked || instrumentBlocked} onClick={transcribe}>{stage === 'error' ? 'Try transcription again' : 'Create sheet music'}<span aria-hidden="true"> →</span></button>{busy && stage !== 'rendering' && <button onClick={stop}>Stop waiting</button>}</div>
           <div className={`status ${stage}`} role="status" aria-live="polite"><span className="status-dot" /><span>{labels[stage]}{progress !== undefined && busy ? ` · ${progress}%` : ''}</span></div>
           {busy && <progress aria-label={labels[stage]} max="100" value={progress} />}
-          {error && <p className="error-text" role="alert">{error}</p>}
+          {error && <p className="error-text" role="alert">{error}{stage === 'error' && file && <button className="retry" onClick={transcribe}>Retry</button>}</p>}
           <aside className="process-note"><span aria-hidden="true">✧</span><div><h3>From sound to score</h3><p>MuScriptor transcribes your audio. Real MusicXML becomes staff notation, ready to read and export.</p></div></aside>
         </section>
         <section className="manuscript" aria-labelledby="score-title" aria-busy={stage === 'rendering'}><div className="section-heading manuscript-heading"><span className="section-number">02</span><h2 id="score-title">Your manuscript</h2>{stage === 'complete' && !scoreFailed && <span className="ready-badge">Ready to read</span>}</div>
           {ENABLE_NOTE_HIGHLIGHTING && highlightedNote && <p className="sr-only" aria-live="polite">Following the highlighted note.</p>}
           {xml ? <ScoreViewer xml={xml} onReady={ready} onRenderFailure={handleRenderFailure} activeNoteId={activeNoteId} onNoteHighlight={handleNoteHighlight} onTimelineChange={handleTimelineChange} /> : <div className="empty-score"><span className="manuscript-seal" aria-hidden="true">♫</span><p className="eyebrow">A LITTLE SPACE FOR YOUR NEXT MELODY</p><h3>{stage === 'rendering' ? 'Preparing your manuscript…' : 'Your score starts with a sound.'}</h3><p>Once your recording is transcribed,<br />your sheet music will appear here.</p><div className="empty-divider" /><small>Staff notation · Playback · MIDI & MusicXML</small></div>}
-          {result && <><div className="exports"><div><h3>Keep making music</h3><p>Open your score in your favourite music editor.</p></div><div className="export-buttons"><a className="button" href={result.midiUrl} download="transcription.mid">↓ Download MIDI</a><a className="button" href={result.musicxmlUrl} download="transcription.musicxml">↓ Download MusicXML</a></div></div>{(result.audioUrl || source) && <Playback src={result.audioUrl || source} generated={!!result.audioUrl} onTimeMs={ENABLE_NOTE_HIGHLIGHTING ? setTimeMs : undefined} />}</>}
+          {result && <><div className="exports"><div><h3>Keep making music</h3><p>Open your score in your favourite music editor.</p></div><div className="export-buttons"><a className="button" href={result.midiUrl} download="transcription.mid">↓ Download MIDI</a><a className="button" href={result.musicxmlUrl} download="transcription.musicxml">↓ Download MusicXML</a></div></div><div className="result-meta" aria-label="Transcription details">{metadataEngine && <span className="meta-item">Engine: <strong>{metadataEngine}</strong></span>}{metadataModel && <span className="meta-item">Model: <strong>{metadataModel}</strong></span>}{probedDuration != null && <span className="meta-item">Duration: <strong>{formatDurationSec(probedDuration)}</strong></span>}{transcriptionMs != null && <span className="meta-item">Transcription time: <strong>{formatDurationSec(Math.ceil(transcriptionMs / 1000))}</strong></span>}</div>{PLAYBACK_GENERATION_ENABLED && <div className="exports playback-generation"><div><h3>Score-aligned playback</h3><p>Generate audio that follows your transcribed notation instead of the original recording.</p></div><button className="button" disabled={generatingPlayback || !!result.audioUrl} onClick={startGeneratedPlayback}>{generatingPlayback ? 'Generating…' : result.audioUrl ? 'Playback ready ✓' : 'Generate playback'}</button></div>}{(result.audioUrl || source) && <Playback src={result.audioUrl || source} generated={!!result.audioUrl} onTimeMs={ENABLE_NOTE_HIGHLIGHTING ? setTimeMs : undefined} />}</>}
         </section>
       </div>
     </main>

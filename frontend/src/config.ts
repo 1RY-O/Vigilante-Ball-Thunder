@@ -25,3 +25,19 @@
  *   - the UI keeps saying "No note-following data available", which is true.
  */
 export const ENABLE_NOTE_HIGHLIGHTING = false
+
+/**
+ * Score-aligned playback generation (POST /api/artifacts/:id/playback).
+ *
+ * OFF: the backend does not implement this endpoint yet (see
+ * BACKEND_CONTRACT.md "Not implemented" and BACKEND_REQUESTS.md), so the
+ * "Generate playback" control is hidden — showing it would imply a feature
+ * that cannot actually produce a score-aligned audioUrl.
+ *
+ * Flip this to `true` only once the backend accepts the playback request and
+ * returns an audioUrl whose timebase IS the score's. That is the ONLY
+ * condition under which note-following highlighting is honest for generated
+ * playback (see the ENABLE_NOTE_HIGHLIGHTING note above); while this flag is
+ * false, playback uses the user's ORIGINAL recording and highlights stay off.
+ */
+export const PLAYBACK_GENERATION_ENABLED = false

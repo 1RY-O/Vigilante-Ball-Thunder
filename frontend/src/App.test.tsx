@@ -3,6 +3,22 @@ import { it, expect, vi } from 'vitest'
 import App from './App'
 import Playback from './Playback'
 
+// The engraving engine is mocked so the app's own flow runs without WASM; the
+// picked instrument field is asserted from the real FormData the app built.
+vi.mock('verovio/wasm', () => ({ default: vi.fn(async () => ({})) }))
+vi.mock('verovio/esm', () => ({
+  VerovioToolkit: class {
+    setOptions() { return true }
+    loadData() { return true }
+    getPageCount() { return 1 }
+    renderToSVG() { return '<svg class="definition-scale"><g class="note" id="n1"></g></svg>' }
+    getElementsAtTime() { return {} }
+    destroy() {}
+  },
+}))
+
+const MUSIC_XML = "<?xml version='1.0'?><score-partwise version='4.0'><part id='P1'/></score-partwise>"
+
 // jsdom never fires audio metadata events; stub a decoder that reports
 // duration immediately (this is a test stub for the DOM API, not a mock of
 // backend data).
@@ -157,3 +173,81 @@ it('stop waiting cancels the job and stops polling', async () => {
   await new Promise(resolve => setTimeout(resolve, pollCycleMs + 200))
   expect(pollCalls()).toBe(before)
 }, 15000)
+it('sends the chosen instrument hint along with the upload', async () => {
+  const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+    if (url === '/api/capabilities') return Response.json({ formats: ['mp3', 'wav', 'flac'], maxUploadBytes: 1024 * 1024, maxAudioDurationSec: 600, engine: { name: 'stub', mock: true, available: true } })
+    if (url === '/api/transcriptions/job-1') return Response.json({ id: 'job-1', status: 'complete', progress: 100, result: { musicxmlUrl: '/api/artifacts/job-1/musicxml', midiUrl: '/api/artifacts/job-1/midi' } })
+    return new Response(MUSIC_XML, { status: 200, headers: { 'Content-Type': 'application/vnd.recordare.musicxml+xml' } })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  const xhr = { open: vi.fn(), upload: {} as { onprogress: (e: object) => void }, send: vi.fn(), abort: vi.fn(), status: 202, responseText: '{"id":"job-1","status":"queued"}', onload: () => {}, onloadend: () => {} }
+  vi.stubGlobal('XMLHttpRequest', class { constructor() { return xhr } })
+  vi.stubGlobal('URL', Object.assign(URL, { createObjectURL: vi.fn(() => 'blob:recording'), revokeObjectURL: vi.fn() }))
+  stubAudioDecoder(30)
+  render(<App />)
+  const input = screen.getByLabelText('Choose audio recording')
+  await waitFor(() => expect(input).toBeEnabled())
+  fireEvent.change(screen.getByLabelText('Instrument'), { target: { value: 'guitar' } })
+  fireEvent.change(input, { target: { files: [new File(['audio'], 'melody.wav')] } })
+  await screen.findByText('Recording selected')
+  fireEvent.click(screen.getByRole('button', { name: 'Create sheet music' }))
+  const form = xhr.send.mock.calls[0][0]
+  expect(form.get('instrument')).toBe('guitar')
+  expect(form.get('instrumentDetail')).toBeNull()
+  xhr.onload(); xhr.onloadend()
+}, 20000)
+it('renders the sheet-type selector honestly disabled while unsupported', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ formats: ['mp3', 'wav', 'flac'], maxUploadBytes: 1024 * 1024, engine: { name: 'stub', mock: true, available: true } })))
+  render(<App />)
+  const select = await screen.findByRole('combobox', { name: 'Sheet type' })
+  expect(select).toBeDisabled()
+  expect(screen.getByText('Coming soon')).toBeInTheDocument()
+  expect(screen.getByText(/does not accept sheet-type selection/i)).toBeInTheDocument()
+})
+it('shows only metadata fields the backend actually returned', async () => {
+  const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+    if (url === '/api/capabilities') return Response.json({ formats: ['mp3', 'wav', 'flac'], maxUploadBytes: 1024 * 1024, maxAudioDurationSec: 600, engine: { name: 'stub', mock: true, available: true } })
+    if (url === '/api/transcriptions/job-1') return Response.json({ id: 'job-1', status: 'complete', progress: 100, result: { musicxmlUrl: '/api/artifacts/job-1/musicxml', midiUrl: '/api/artifacts/job-1/midi' } })
+    return new Response(MUSIC_XML, { status: 200, headers: { 'Content-Type': 'application/vnd.recordare.musicxml+xml' } })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  const xhr = { open: vi.fn(), upload: {} as { onprogress: (e: object) => void }, send: vi.fn(), abort: vi.fn(), status: 202, responseText: '{"id":"job-1","status":"queued"}', onload: () => {}, onloadend: () => {} }
+  vi.stubGlobal('XMLHttpRequest', class { constructor() { return xhr } })
+  vi.stubGlobal('URL', Object.assign(URL, { createObjectURL: vi.fn(() => 'blob:recording'), revokeObjectURL: vi.fn() }))
+  stubAudioDecoder(30)
+  render(<App />)
+  const input = screen.getByLabelText('Choose audio recording')
+  await waitFor(() => expect(input).toBeEnabled())
+  fireEvent.change(input, { target: { files: [new File(['audio'], 'melody.wav')] } })
+  await screen.findByText('Recording selected')
+  fireEvent.click(screen.getByRole('button', { name: 'Create sheet music' }))
+  xhr.onload(); xhr.onloadend()
+  // Engine with the mock label is real data from capabilities...
+  expect(await screen.findByText('stub (MOCK)', {}, { timeout: 8000 })).toBeInTheDocument()
+  // ...but the backend returned no model and no detected instruments, so
+  // neither is invented for the user.
+  expect(screen.queryByText(/Model:/)).not.toBeInTheDocument()
+  expect(screen.queryByText(/detected instruments/i)).not.toBeInTheDocument()
+  expect(screen.getByRole('link', { name: /Download MusicXML/ })).toBeInTheDocument()
+}, 20000)
+it('keeps the generate-playback action hidden until the backend supports it', async () => {
+  const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+    if (url === '/api/capabilities') return Response.json({ formats: ['mp3', 'wav', 'flac'], maxUploadBytes: 1024 * 1024, maxAudioDurationSec: 600, engine: { name: 'stub', mock: true, available: true } })
+    if (url === '/api/transcriptions/job-1') return Response.json({ id: 'job-1', status: 'complete', progress: 100, result: { musicxmlUrl: '/api/artifacts/job-1/musicxml', midiUrl: '/api/artifacts/job-1/midi' } })
+    return new Response(MUSIC_XML, { status: 200, headers: { 'Content-Type': 'application/vnd.recordare.musicxml+xml' } })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  const xhr = { open: vi.fn(), upload: {} as { onprogress: (e: object) => void }, send: vi.fn(), abort: vi.fn(), status: 202, responseText: '{"id":"job-1","status":"queued"}', onload: () => {}, onloadend: () => {} }
+  vi.stubGlobal('XMLHttpRequest', class { constructor() { return xhr } })
+  vi.stubGlobal('URL', Object.assign(URL, { createObjectURL: vi.fn(() => 'blob:recording'), revokeObjectURL: vi.fn() }))
+  stubAudioDecoder(30)
+  render(<App />)
+  const input = screen.getByLabelText('Choose audio recording')
+  await waitFor(() => expect(input).toBeEnabled())
+  fireEvent.change(input, { target: { files: [new File(['audio'], 'melody.wav')] } })
+  await screen.findByText('Recording selected')
+  fireEvent.click(screen.getByRole('button', { name: 'Create sheet music' }))
+  xhr.onload(); xhr.onloadend()
+  expect(await screen.findByText('Keep making music', {}, { timeout: 8000 })).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /Generate playback/ })).not.toBeInTheDocument()
+}, 20000)

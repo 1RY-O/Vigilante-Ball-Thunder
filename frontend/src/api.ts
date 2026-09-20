@@ -1,3 +1,5 @@
+import { formatBytes, formatDurationSec } from './format'
+
 export interface EngineInfo { name?: string; mock?: boolean; available?: boolean; checking?: boolean; code?: string; reason?: string; model?: string }
 export interface Capabilities { formats: string[]; maxUploadBytes: number; engine?: EngineInfo; maxAudioDurationSec?: number }
 export interface Result { musicxmlUrl: string; midiUrl: string; audioUrl?: string }
@@ -45,7 +47,7 @@ export async function capabilities(signal?: AbortSignal): Promise<Capabilities> 
 export function validateFile(file: File, caps: Capabilities): string | null {
   if (!caps.formats.includes(file.name.split('.').pop()?.toLowerCase() ?? '')) return `Choose a ${caps.formats.map(f => f.toUpperCase()).join(', ')} recording.`
   if (!file.size) return 'This file is empty. Please choose a recording with audio.'
-  if (file.size > caps.maxUploadBytes) return `This recording is too large. The limit is ${Math.floor(caps.maxUploadBytes / 1024 / 1024)} MB.`
+  if (file.size > caps.maxUploadBytes) return `This recording is too large: your file is ${formatBytes(file.size)}, the limit is ${formatBytes(caps.maxUploadBytes)} — ${formatBytes(file.size - caps.maxUploadBytes)} over the limit.`
   return null
 }
 /** Best-effort duration probe via the browser's audio decoder. Returns null
@@ -65,10 +67,7 @@ export function probeDurationSec(file: File, timeoutMs = 8000): Promise<number |
 }
 export function validateDuration(durationSec: number | null, caps: Capabilities): string | null {
   if (durationSec === null || !caps.maxAudioDurationSec) return null
-  if (durationSec > caps.maxAudioDurationSec) {
-    const min = Math.round(caps.maxAudioDurationSec / 60)
-    return `This recording is too long. The limit is ${min} minute${min === 1 ? '' : 's'}.`
-  }
+  if (durationSec > caps.maxAudioDurationSec) return `This recording is too long: your recording is ${formatDurationSec(durationSec)}, the limit is ${formatDurationSec(caps.maxAudioDurationSec)} — ${formatDurationSec(durationSec - caps.maxAudioDurationSec)} over the limit.`
   return null
 }
 export function parseJob(value: unknown): Job {
@@ -88,7 +87,7 @@ export function parseJob(value: unknown): Job {
   }
   return job
 }
-export function upload(file: File, signal: AbortSignal, onProgress: (progress: number) => void): Promise<Job> {
+export function upload(file: File, signal: AbortSignal, onProgress: (progress: number) => void, hints?: { instrument?: string; instrumentDetail?: string }): Promise<Job> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
     const abort = () => xhr.abort()
@@ -106,8 +105,22 @@ export function upload(file: File, signal: AbortSignal, onProgress: (progress: n
     if (signal.aborted) { reject(new DOMException('Aborted', 'AbortError')); return }
     const form = new FormData()
     form.append('file', file)
+    // The chosen instrument hint is always sent (auto = "no hint"). The
+    // deployed backend currently ignores unknown fields; the requested shape
+    // is documented in BACKEND_REQUESTS.md.
+    if (hints?.instrument) form.append('instrument', hints.instrument)
+    if (hints?.instrumentDetail) form.append('instrumentDetail', hints.instrumentDetail)
     xhr.send(form)
   })
+}
+/** Score-aligned playback for a completed job. The deployed backend does not
+ *  implement POST /api/artifacts/:id/playback yet (BACKEND_REQUESTS.md), so
+ *  the UI keeps the generate-playback control hidden behind
+ *  config.PLAYBACK_GENERATION_ENABLED. */
+export async function generatePlayback(id: string, signal?: AbortSignal): Promise<string> {
+  const response = await fetch(`${base}/artifacts/${encodeURIComponent(id)}/playback`, { method: 'POST', signal, headers: { Accept: 'application/json' } })
+  if (!response.ok) throw new ServiceError(unavailable)
+  return artifactUrl((await response.json() as { audioUrl?: unknown }).audioUrl)
 }
 export async function getJob(id: string, signal: AbortSignal) { return parseJob(await json(`${base}/transcriptions/${encodeURIComponent(id)}`, signal)) }
 export async function cancelJob(id: string): Promise<void> {

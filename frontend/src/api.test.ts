@@ -81,4 +81,24 @@ describe('API boundary', () => {
     xhr.onload(); xhr.onloadend()
     await expect(promise).resolves.toEqual({ id: '1', status: 'queued' })
   })
+  it('sends the chosen instrument hint as a form field', async () => {
+    const xhr = { open: vi.fn(), upload: {} as { onprogress: (e: object) => void }, send: vi.fn(), abort: vi.fn(), status: 202, responseText: '{"id":"1","status":"queued"}', onload: () => {}, onloadend: () => {} }
+    vi.stubGlobal('XMLHttpRequest', class { constructor() { return xhr } })
+    const promise = upload(new File(['audio'], 'song.wav'), new AbortController().signal, vi.fn(), { instrument: 'piano' })
+    const form = xhr.send.mock.calls[0][0]
+    expect(form.get('instrument')).toBe('piano')
+    expect(form.get('instrumentDetail')).toBeNull()
+    xhr.onload(); xhr.onloadend()
+    await expect(promise).resolves.toEqual({ id: '1', status: 'queued' })
+  })
+  it('sends a free-text instrument detail only for Other', async () => {
+    const xhr = { open: vi.fn(), upload: {} as { onprogress: (e: object) => void }, send: vi.fn(), abort: vi.fn(), status: 202, responseText: '{"id":"1","status":"queued"}', onload: () => {}, onloadend: () => {} }
+    vi.stubGlobal('XMLHttpRequest', class { constructor() { return xhr } })
+    const promise = upload(new File(['audio'], 'song.wav'), new AbortController().signal, vi.fn(), { instrument: 'other', instrumentDetail: 'saxophone solo' })
+    const form = xhr.send.mock.calls[0][0]
+    expect(form.get('instrument')).toBe('other')
+    expect(form.get('instrumentDetail')).toBe('saxophone solo')
+    xhr.onload(); xhr.onloadend()
+    await expect(promise).resolves.toEqual({ id: '1', status: 'queued' })
+  })
 })
