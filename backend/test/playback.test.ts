@@ -5,6 +5,7 @@ import path from 'node:path';
 
 import { makeTestApp, makeWav, waitForTerminal } from './helpers.js';
 import type { TestApp } from './helpers.js';
+import { PlaybackService } from '../src/services/playback/playbackService.js';
 
 /**
  * POST /api/artifacts/:id/playback + GET /api/artifacts/:id/audio.
@@ -33,6 +34,8 @@ interface RenderDouble {
   soundfont: string;
   /** Where the double records the argv the backend passed. */
   argvFile: string;
+  /** The double appends one 'x' here per render invocation (amplifier tests). */
+  countFile: string;
 }
 
 /**
@@ -46,6 +49,7 @@ async function makeRenderDouble(): Promise<RenderDouble> {
   const bin = path.join(dir, 'fake-fluidsynth.cjs');
   const soundfont = path.join(dir, 'dummy-test-soundfont.sf2');
   const argvFile = path.join(dir, 'argv.json');
+  const countFile = path.join(dir, 'renders.count');
   await fs.writeFile(soundfont, 'TEST DOUBLE — not a real SoundFont');
   await fs.writeFile(
     bin,
@@ -58,6 +62,7 @@ async function makeRenderDouble(): Promise<RenderDouble> {
       "// Answer the availability probe like the real binary (exit 0).",
       "if (argv.includes('--version')) { process.exit(0); }",
       'if (process.env.VBT_DOUBLE_ARGV) fs.writeFileSync(process.env.VBT_DOUBLE_ARGV, JSON.stringify(argv));',
+      'if (process.env.VBT_DOUBLE_COUNT) fs.appendFileSync(process.env.VBT_DOUBLE_COUNT, \'x\');',
       "const outIndex = argv.indexOf('-F');",
       'if (outIndex < 0 || !argv[outIndex + 1]) { process.stderr.write("no -F\\n"); process.exit(1); }',
       'const sampleRate = 44100;',
@@ -75,7 +80,7 @@ async function makeRenderDouble(): Promise<RenderDouble> {
     ].join('\n'),
   );
   await fs.chmod(bin, 0o755);
-  return { dir, bin, soundfont, argvFile };
+  return { dir, bin, soundfont, argvFile, countFile };
 }
 
 async function completeJob(t: TestApp, filename = 'play.wav'): Promise<string> {
@@ -251,6 +256,43 @@ describe('POST /api/artifacts/:id/playback — real plumbing (TEST-DOUBLE synthe
     } finally {
       await t.cleanup();
       await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('concurrent identical renders share ONE FluidSynth run (no amplifier)', async () => {
+    // The playback endpoint is unauthenticated; without bounds, N concurrent
+    // requests would spawn N FluidSynth processes. renderBounded dedupes
+    // in-flight renders with the same output path and caps global concurrency.
+    const double = await makeRenderDouble();
+    process.env['VBT_DOUBLE_COUNT'] = double.countFile;
+    const service = new PlaybackService({
+      fluidsynthBin: double.bin,
+      soundfontPath: double.soundfont,
+      timeoutMs: 120_000,
+      maxConcurrentRenders: 1,
+    });
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'vbt-playback-bounded-'));
+    try {
+      // Sanity: the double is a working stand-in for the availability probe.
+      expect((await service.probe(true)).available).toBe(true);
+
+      const midiPath = path.join(dir, 'transcription.mid');
+      const wavPath = path.join(dir, 'playback.wav');
+      await fs.writeFile(midiPath, 'MIDI INPUT (ignored by the double)');
+      const [a, b, c] = await Promise.all([
+        service.renderBounded(midiPath, wavPath),
+        service.renderBounded(midiPath, wavPath),
+        service.renderBounded(midiPath, wavPath),
+      ]);
+      for (const d of [a, b, c]) expect(d).toBeCloseTo(0.25, 2);
+
+      // Exactly ONE subprocess invocation despite three concurrent callers.
+      const count = await fs.readFile(double.countFile, 'utf8');
+      expect(count).toBe('x');
+    } finally {
+      delete process.env['VBT_DOUBLE_COUNT'];
+      await fs.rm(dir, { recursive: true, force: true });
+      await fs.rm(double.dir, { recursive: true, force: true });
     }
   });
 });

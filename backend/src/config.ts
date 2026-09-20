@@ -55,6 +55,12 @@ export interface Config {
   soundfontPath: string;
   /** Hard budget for one FluidSynth render (killed on timeout). */
   playbackTimeoutMs: number;
+  /**
+   * Upper bound on FluidSynth renders running at once. Playback is
+   * unauthenticated and spawns an OS process per render; without this cap the
+   * endpoint would be a resource amplifier.
+   */
+  maxPlaybackConcurrency: number;
   /** Only whether a token exists; the value is only forwarded to the worker. */
   hfTokenPresent: boolean;
 }
@@ -117,6 +123,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     fluidsynthBin: env.FLUIDSYNTH_BIN?.trim() || 'fluidsynth',
     soundfontPath: defaultSoundfontPath(env),
     playbackTimeoutMs: Math.max(1_000, int(env.PLAYBACK_TIMEOUT_MS, 120_000)),
+    maxPlaybackConcurrency: Math.max(1, int(env.MAX_PLAYBACK_CONCURRENCY, 1)),
     hfTokenPresent: !!env.HF_TOKEN && env.HF_TOKEN.trim() !== '',
   };
 }

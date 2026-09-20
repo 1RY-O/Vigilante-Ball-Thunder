@@ -198,6 +198,9 @@ export function buildArtifactsRouter(ctx: AppContext): Router {
    */
   router.post(
     '/:id/playback',
+    // Process-spawning endpoint: same per-IP budget as transcription, so an
+    // unauthenticated client cannot hammer renders without limit.
+    ctx.rateLimiter,
     asyncH(async (req, res) => {
       const job = ctx.jobManager.getJob(String(req.params.id ?? ''));
       if (!job) {
@@ -228,7 +231,9 @@ export function buildArtifactsRouter(ctx: AppContext): Router {
         );
       }
       const wavPath = path.join(job.workDir, 'playback.wav');
-      const durationSec = await ctx.playback.renderMidiToWav(job.midiPath, wavPath);
+      // Bounded + deduped: concurrent identical requests share one FluidSynth
+      // run, and global concurrency stays <= MAX_PLAYBACK_CONCURRENCY.
+      const durationSec = await ctx.playback.renderBounded(job.midiPath, wavPath);
       ctx.jobManager.recordPlayback(job.id, wavPath);
       res.status(200).json({ audioUrl, durationSec });
     }),

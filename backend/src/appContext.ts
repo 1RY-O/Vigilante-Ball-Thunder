@@ -80,6 +80,7 @@ export async function buildContext(overrides: ContextOverrides = {}): Promise<Ap
       fluidsynthBin: config.fluidsynthBin,
       soundfontPath: config.soundfontPath,
       timeoutMs: config.playbackTimeoutMs,
+      maxConcurrentRenders: config.maxPlaybackConcurrency,
     });
 
   return {

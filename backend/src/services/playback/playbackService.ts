@@ -61,10 +61,46 @@ export class PlaybackService {
   private readonly timeoutMs: number;
   private cached: { at: number; value: PlaybackAvailability } | null = null;
 
-  constructor(opts: { fluidsynthBin: string; soundfontPath: string; timeoutMs: number }) {
+  constructor(opts: { fluidsynthBin: string; soundfontPath: string; timeoutMs: number; maxConcurrentRenders: number }) {
     this.fluidsynthBin = opts.fluidsynthBin;
     this.soundfontPath = opts.soundfontPath;
     this.timeoutMs = opts.timeoutMs;
+    this.maxConcurrentRenders = Math.max(1, opts.maxConcurrentRenders);
+  }
+
+  private readonly maxConcurrentRenders: number;
+  private activeRenders = 0;
+  private readonly renderWaiters: Array<() => void> = [];
+  /** Renders currently running or queued, keyed by output path. */
+  private readonly inFlight = new Map<string, Promise<number>>();
+
+  /**
+   * Resource-bounded render. POST /api/artifacts/:id/playback is
+   * unauthenticated, so without bounds it would be an amplifier: one FluidSynth
+   * process per request. Two bounds close that:
+   *  - identical in-flight renders (same output path) share ONE subprocess;
+   *  - at most `maxConcurrentRenders` FluidSynth processes run at any moment;
+   *    further callers wait instead of spawning.
+   */
+  async renderBounded(midiPath: string, wavPath: string): Promise<number> {
+    const existing = this.inFlight.get(wavPath);
+    if (existing) return existing;
+    const promise = (async () => {
+      while (this.activeRenders >= this.maxConcurrentRenders) {
+        await new Promise<void>((resolve) => this.renderWaiters.push(resolve));
+      }
+      this.activeRenders++;
+      try {
+        return await this.renderMidiToWav(midiPath, wavPath);
+      } finally {
+        this.activeRenders--;
+        this.renderWaiters.shift()?.();
+      }
+    })().finally(() => {
+      this.inFlight.delete(wavPath);
+    });
+    this.inFlight.set(wavPath, promise);
+    return promise;
   }
 
   /**
