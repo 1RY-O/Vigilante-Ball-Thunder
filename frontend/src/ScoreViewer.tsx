@@ -7,7 +7,7 @@ import { ENABLE_NOTE_HIGHLIGHTING } from './config'
  * Why the on-screen notation is missing. Reported so callers can log or
  * announce it, never as a claim about the backend.
  */
-export type RenderFailureCode = 'verovio-score-rejected' | 'verovio-init-failed'
+export type RenderFailureCode = 'verovio-score-rejected' | 'verovio-init-failed' | 'wasm-unavailable'
 
 /**
  * Shown when the notation engine cannot produce an on-screen score.
@@ -20,6 +20,17 @@ export type RenderFailureCode = 'verovio-score-rejected' | 'verovio-init-failed'
  * to start the engraving engine. Both are covered by the same honest text.
  */
 export const SCORE_RENDER_ERROR_TEXT = 'The notation could not be displayed for this recording. You can still download your files below.'
+
+/**
+ * Shown ONLY when this browser has no WebAssembly at all (e.g. Cromite with
+ * JavaScript JIT disabled). Unlike SCORE_RENDER_ERROR_TEXT this one names a
+ * cause, because renderScore checks `typeof WebAssembly` before touching
+ * Verovio — reaching this message proves the engine was never at fault, the
+ * browser simply cannot run it. The per-site remedy is Cromite-specific
+ * because that is the browser family known to gate WASM behind its JIT
+ * switch; every other case is covered by "try a different browser".
+ */
+export const WASM_UNAVAILABLE_TEXT = 'This browser does not have WebAssembly enabled, which is required to engrave sheet music. On Cromite, you can enable it per-site via the lock icon → Site settings → JavaScript JIT. Alternatively, try a different browser.'
 
 /** One stretch of time during which a single note is sounding. */
 export interface NoteSpan { id: string; startMs: number; endMs: number }
@@ -78,8 +89,16 @@ export function buildTimeline(toolkit: VerovioToolkit): NoteSpan[] {
 /** Thrown when Verovio itself refuses the score (as opposed to failing to start). */
 class ScoreRejected extends Error {}
 
+/** Thrown before Verovio is even loaded: this browser cannot run WebAssembly. */
+class WasmUnavailable extends Error {}
+
 let modulePromise: Promise<unknown> | undefined
 async function renderScore(xml: string) {
+  // Hardened browsers (e.g. Cromite with JavaScript JIT off) expose no
+  // WebAssembly global at all. Detect that here — before importing or
+  // instantiating Verovio, which would fail later with a bare "WebAssembly
+  // is not defined" ReferenceError from inside the wasm glue.
+  if (typeof WebAssembly === 'undefined') throw new WasmUnavailable('WebAssembly is not available in this browser')
   const [{ default: createModule }, { VerovioToolkit }] = await Promise.all([import('verovio/wasm'), import('verovio/esm')])
   modulePromise ??= createModule().catch(error => { modulePromise = undefined; throw error })
   let toolkit: VerovioToolkit | undefined
@@ -130,7 +149,7 @@ export default function ScoreViewer({ xml, onReady, onRenderFailure, activeNoteI
         // Keep the cause-free inline message for the user; the original
         // error goes to the console for diagnosis, never to the UI.
         console.error('ScoreViewer: the notation could not be rendered.', error)
-        const code: RenderFailureCode = error instanceof ScoreRejected ? 'verovio-score-rejected' : 'verovio-init-failed'
+        const code: RenderFailureCode = error instanceof WasmUnavailable ? 'wasm-unavailable' : error instanceof ScoreRejected ? 'verovio-score-rejected' : 'verovio-init-failed'
         setFailure(code)
         onRenderFailure(code)
       })
@@ -159,7 +178,7 @@ export default function ScoreViewer({ xml, onReady, onRenderFailure, activeNoteI
   return <>
     <div className="score-tools"><span>{pages.length ? `${pages.length} ${pages.length === 1 ? 'page' : 'pages'} · MusicXML notation` : failure ? 'Notation unavailable' : 'Engraving your manuscript…'}</span><div className="zoom"><button aria-label="Zoom out" disabled={zoom <= 60} onClick={() => setZoom(z => z - 10)}>−</button><output aria-label="Zoom level">{zoom}%</output><button aria-label="Zoom in" disabled={zoom >= 160} onClick={() => setZoom(z => z + 10)}>+</button></div></div>
     <div className="score-scroll" ref={scroll} tabIndex={0} aria-label="Sheet music pages">
-      {failure && <p className="score-error" role="alert" data-render-failure={failure}>{SCORE_RENDER_ERROR_TEXT}</p>}
+      {failure && <p className="score-error" role="alert" data-render-failure={failure}>{failure === 'wasm-unavailable' ? WASM_UNAVAILABLE_TEXT : SCORE_RENDER_ERROR_TEXT}</p>}
       {pages.map((svg, i) => <div className="score-page" key={i} style={{ width: `${840 * zoom / 100}px` }} role="img" aria-label={`Sheet music, page ${i + 1}`} dangerouslySetInnerHTML={{ __html: svg }} />)}
     </div>
   </>

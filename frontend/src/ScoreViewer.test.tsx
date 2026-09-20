@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
-import ScoreViewer, { SCORE_RENDER_ERROR_TEXT } from './ScoreViewer'
+import ScoreViewer, { SCORE_RENDER_ERROR_TEXT, WASM_UNAVAILABLE_TEXT } from './ScoreViewer'
 
 // The engraving engine is the only thing mocked here: these tests drive the
 // REAL ScoreViewer component and the REAL error handling, and the fixture SVG
@@ -55,4 +55,23 @@ it('reports an engine that cannot start and still renders an inline message', as
   render(<ScoreViewer xml="<score-partwise version='4.0'/>" onReady={vi.fn()} onRenderFailure={onRenderFailure} />)
   expect(await screen.findByRole('alert')).toHaveTextContent(SCORE_RENDER_ERROR_TEXT)
   expect(onRenderFailure).toHaveBeenCalledWith('verovio-score-rejected')
+})
+
+it('names the real cause when the browser has no WebAssembly, before Verovio is even used', async () => {
+  vi.stubGlobal('WebAssembly', undefined)
+  // A score Verovio would refuse: the WASM check must still win, proving it
+  // runs before any import, load, or engraving attempt.
+  verovio.loadData = false
+  const onReady = vi.fn()
+  const onRenderFailure = vi.fn()
+  render(<ScoreViewer xml="<score-partwise version='4.0'/>" onReady={onReady} onRenderFailure={onRenderFailure} />)
+
+  const alert = await screen.findByRole('alert')
+  expect(alert).toHaveTextContent(WASM_UNAVAILABLE_TEXT)
+  expect(alert).toHaveAttribute('data-render-failure', 'wasm-unavailable')
+  expect(onRenderFailure).toHaveBeenCalledWith('wasm-unavailable')
+  expect(onReady).not.toHaveBeenCalled()
+  // The generic message must not appear anywhere: this failure has a known,
+  // actionable cause and says so.
+  expect(screen.queryByText(SCORE_RENDER_ERROR_TEXT)).not.toBeInTheDocument()
 })
