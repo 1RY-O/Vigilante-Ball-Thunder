@@ -21,6 +21,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 class CountingEngine implements TranscriptionEngine {
   readonly name = 'availability-monitor-test-double';
   readonly isMock = true;
+  readonly supportedSheetTypes = ['melody-chords'] as const;
   calls = 0;
   constructor(private readonly script: EngineAvailability[]) {}
   async available(): Promise<EngineAvailability> {

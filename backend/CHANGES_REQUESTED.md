@@ -108,4 +108,114 @@ Render's free tier sleeps instances; the very first capabilities response
 after a cold boot can legitimately be `engine-warming-up` for ~1 tick. A
 mount-time single fetch turns that into a hard error for the user.
 
+## 2026-09-20 — New contract surface: instrument hints, sheetType, playback, richer result metadata
+
+All additive and backward-compatible: existing clients that send nothing new
+get exactly the old behavior. Field names are load-bearing (the frontend
+already aligns to them) — do not rename without a new entry here.
+
+### 1. Optional form field `instrument` (+ `instrumentDetail` when `other`)
+
+`POST /api/transcriptions` accepts multipart text field:
+
+- `instrument` — enum `auto | piano | guitar | bass | vocals | drums | multi | other`
+  (default when absent: `auto` = no hint; `multi`/`other` likewise send no
+  constraint — inventing groups for them would forbid the real instruments).
+- `instrumentDetail` — free text, accepted only as documentation for
+  `instrument=other` (e.g. `"saxophone solo"`); currently **accepted and
+  ignored** (no consumer yet). Never an error.
+- Unknown `instrument` value → `400 { error: "Unsupported instrument hint
+  \"<value>\". Use one of: auto, piano, guitar, bass, vocals, drums, multi,
+  other." }`.
+- Named hints constrain the MuScriptor decode to its MT3 group names
+  (piano→acoustic/electric_piano, guitar→acoustic/clean/distorted_electric,
+  bass→acoustic/electric_bass, vocals→voice, drums→drums).
+
+### 2. Optional form field `sheetType`
+
+- `sheetType` — enum `melody-chords | piano-grand | lead-sheet`
+  (default when absent: `melody-chords` = current behavior, unchanged).
+- Unknown value → `400 { error: "Unsupported sheet type \"<value>\". Use one
+  of: melody-chords, piano-grand, lead-sheet" }`.
+- Layout the engine cannot produce → `501 { error: "not-implemented", code:
+  "sheet-type-unsupported", message: "The \"<type>\" sheet layout is not
+  implemented by the <engine> engine on this deployment. Available layouts:
+  <...>" }`. Never silently downgraded. (Render's stub engine serves only
+  `melody-chords`; the local MuScriptor engine serves all three via music21
+  post-processing of the real decoded MIDI.)
+- A mid-job worker-side layout failure settles the job as
+  `error { code: "not-implemented", cause: "sheet-type-unsupported" }` with no
+  artifact written (`GET` artifact → 409).
+
+### 3. Playback: `POST /api/artifacts/:id/playback` + `GET /api/artifacts/:id/audio`
+
+- `POST /api/artifacts/:id/playback` — renders the job's OWN transcription
+  MIDI to WAV with FluidSynth (idempotent; re-request reuses the render):
+  - unknown job → `404 { error: "Job not found." }`
+  - job not complete → `409 { error: "Playback is only available once the transcription is complete." }`
+  - FluidSynth missing → `503 { error: "playback-unavailable", code: "fluidsynth-missing", message: "..." }`
+  - no SoundFont (`SOUNDFONT_PATH` unset and no bundled copy) → `503
+    { error: "playback-unavailable", code: "soundfont-missing", message: "..." }`
+  - render produced no readable audio → `500 { error: "playback-failed", code: "render-failed", message: "..." }`
+  - success → `200 { "audioUrl": "/api/artifacts/<id>/audio", "durationSec": <number> }`
+- `GET /api/artifacts/:id/audio` — serves the WAV: `Content-Type: audio/wav`,
+  exact `Content-Length`, `Cache-Control: private`; 404 unknown job, 409 not
+  generated yet. Until `POST` succeeds, the job's `result` carries **no**
+  `audioUrl`.
+- Frontend action: gate the "Generate playback" button on
+  `GET /api/capabilities → playback.available` (see below) instead of a
+  hardcoded flag.
+
+### 4. Richer `result` on `GET /api/transcriptions/:id` (complete jobs)
+
+Added only when genuinely available — absent values are omitted/`null`,
+never guessed:
+
+```json
+{
+  "result": {
+    "musicxmlUrl": "/api/artifacts/<id>/musicxml",
+    "midiUrl": "/api/artifacts/<id>/midi",
+    "audioUrl": "/api/artifacts/<id>/audio",
+    "engineUsed": "muscriptor (small)",
+    "durationSec": 1.0,
+    "transcriptionMs": 834,
+    "detectedInstruments": ["acoustic_piano"],
+    "metadata": { "tempoBpm": 123.0, "keyName": "C major" }
+  }
+}
+```
+
+- `engineUsed` (string, always): e.g. `"muscriptor (small)"`, or the stub's
+  `"stub (MOCK fixture — synthetic data, not a real transcription)"`.
+- `durationSec` (number | null): worker-measured; `null` when unreported.
+- `transcriptionMs` (integer, always): measured wall clock job-start → complete.
+- `detectedInstruments` (string[] | null): the model's own decoded instrument
+  names; `null` when the engine cannot report them (always `null` for stub).
+- `metadata` (object, optional): present only when ≥1 field extracted —
+  `tempoBpm` (finite BPM from the metronome mark), `keyName` (music21
+  `analyze("key")` name, e.g. `"C major"`). Unreadable → field omitted.
+- Frontend action: render only the fields present; never invent
+  instruments/tempo/key from these being absent.
+
+### 5. New `GET /api/capabilities` sections (drive UI gates from these)
+
+```json
+{
+  "sheetTypes": { "default": "melody-chords", "supported": ["melody-chords"] },
+  "instrumentHints": {
+    "values": ["auto","piano","guitar","bass","vocals","drums","multi","other"],
+    "mapped": { "piano": ["acoustic_piano","electric_piano"], "...": ["..."] }
+  },
+  "playback": { "available": false, "code": "fluidsynth-missing", "reason": "..." }
+}
+```
+
+- `sheetTypes.supported` is engine-aware (`["melody-chords"]` on stub/Render,
+  all three locally) — enable the sheet-type selector from this, not a flag.
+- `instrumentHints.mapped` lists only hints that actually constrain the
+  decode (`auto`/`multi`/`other` intentionally absent).
+- `playback` mirrors the server's real FluidSynth+SoundFont probe
+  (`available`, plus `code`/`reason` only when unavailable).
+
 

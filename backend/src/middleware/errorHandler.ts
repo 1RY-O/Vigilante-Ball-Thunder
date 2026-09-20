@@ -2,7 +2,8 @@ import multer from 'multer';
 import type { NextFunction, Request, Response } from 'express';
 
 import { ValidationError } from '../services/audio/validation.js';
-import { EngineUnavailableError } from '../services/transcription/engine.js';
+import { EngineUnavailableError, NotImplementedError } from '../services/transcription/engine.js';
+import { PlaybackFailedError, PlaybackUnavailableError } from '../services/playback/playbackService.js';
 
 function send(res: Response, status: number, body: unknown): void {
   if (!res.headersSent) res.status(status).json(body);
@@ -29,6 +30,21 @@ export function errorHandler(err: unknown, _req: Request, res: Response, _next: 
     // Honest 503: the engine cannot run (missing deps/token/license). The
     // message is curated and safe; the code lets clients react precisely.
     send(res, 503, { error: 'engine-unavailable', code: err.code, message: err.message });
+    return;
+  }
+  if (err instanceof NotImplementedError) {
+    // Honest 501: the engine is fine, but the requested transformation is not
+    // something this deployment can produce. Never downgraded silently.
+    send(res, 501, { error: 'not-implemented', code: err.code, message: err.message });
+    return;
+  }
+  if (err instanceof PlaybackUnavailableError) {
+    // Honest 503: playback needs FluidSynth + a SoundFont; no fake audio.
+    send(res, 503, { error: 'playback-unavailable', code: err.code, message: err.message });
+    return;
+  }
+  if (err instanceof PlaybackFailedError) {
+    send(res, 500, { error: 'playback-failed', code: 'render-failed', message: err.message });
     return;
   }
   if (err instanceof Error) {

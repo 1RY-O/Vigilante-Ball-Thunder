@@ -9,6 +9,7 @@ import { AvailabilityMonitor } from './services/transcription/availabilityMonito
 import type { TranscriptionEngine } from './services/transcription/engine.js';
 import { MuScriptorEngine } from './services/transcription/muScriptorEngine.js';
 import { StubEngine } from './services/transcription/stubEngine.js';
+import { PlaybackService } from './services/playback/playbackService.js';
 import { buildRateLimiter } from './middleware/rateLimit.js';
 import { buildUploadMiddleware } from './middleware/upload.js';
 
@@ -21,6 +22,8 @@ export interface AppContext {
    */
   availability: AvailabilityMonitor;
   jobManager: JobManager;
+  /** FluidSynth-backed MIDI → WAV rendering (honest 503 when unavailable). */
+  playback: PlaybackService;
   uploadMiddleware: multer.Multer;
   rateLimiter: RequestHandler;
   dispose: () => Promise<void>;
@@ -30,6 +33,7 @@ export interface ContextOverrides {
   config?: Partial<Config>;
   engine?: TranscriptionEngine;
   jobManager?: JobManager;
+  playback?: PlaybackService;
 }
 
 /**
@@ -70,11 +74,20 @@ export async function buildContext(overrides: ContextOverrides = {}): Promise<Ap
   const uploadMiddleware = buildUploadMiddleware(config.uploadDir, config.maxUploadBytes);
   const rateLimiter = buildRateLimiter(config);
 
+  const playback =
+    overrides.playback ??
+    new PlaybackService({
+      fluidsynthBin: config.fluidsynthBin,
+      soundfontPath: config.soundfontPath,
+      timeoutMs: config.playbackTimeoutMs,
+    });
+
   return {
     config,
     engine,
     availability,
     jobManager,
+    playback,
     uploadMiddleware,
     rateLimiter,
     dispose: async () => {

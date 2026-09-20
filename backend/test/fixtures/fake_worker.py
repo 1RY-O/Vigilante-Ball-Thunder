@@ -19,6 +19,14 @@ test fixtures, clearly not real transcription):
   no-write  exit 0 without producing artifacts (engine must detect this)
   crash     print non-JSON noise and exit 2
   sleep     sleep ~25s (used by cancellation tests; killed by the engine)
+  sheet-unsupported  emit the worker's honest sheet-type-unsupported code (exit 3)
+  no-extras OK, but result.json carries only the model — no duration, no
+             instruments, no analysis. Proves the API omits absent values
+             instead of inventing them.
+
+It also records the argv it was invoked with in `invocation.json` inside
+--out, so tests can assert what actually reached the worker (e.g. that
+`--instruments` is only sent for a real hint). Test bookkeeping only.
 """
 
 from __future__ import annotations
@@ -27,6 +35,12 @@ import json
 import os
 import sys
 import time
+
+# Fixture values reported as "detected"/"analysed" by this MOCK worker. They are
+# arbitrary constants on purpose: no test may mistake them for real model output.
+FIXTURE_DETECTED_INSTRUMENTS = ["acoustic_piano"]
+FIXTURE_TEMPO_BPM = 123.0
+FIXTURE_KEY_NAME = "C major"
 
 
 def emit(payload: dict) -> None:
@@ -79,6 +93,20 @@ def main() -> int:
 
     out_dir = arg_value("--out")
     model = arg_value("--model") or "small"
+    sheet_type = arg_value("--sheet-type") or "melody-chords"
+    instruments = arg_value("--instruments")
+
+    if out_dir:
+        # Test bookkeeping: what the engine actually passed to the worker.
+        with open(os.path.join(out_dir, "invocation.json"), "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "args": sys.argv[1:],
+                    "sheetType": sheet_type,
+                    "instruments": instruments,
+                },
+                fh,
+            )
 
     if mode == "sleep":
         time.sleep(25)
@@ -90,6 +118,12 @@ def main() -> int:
         fail("transcription-failed", "Simulated model failure (test fixture).", 3)
     if mode == "gated":
         fail("weights-gated", "Simulated gated-weights failure (test fixture).", 4)
+    if mode == "sheet-unsupported":
+        fail(
+            "sheet-type-unsupported",
+            "Simulated music21 layout failure (test fixture).",
+            3,
+        )
 
     emit({"type": "progress", "stage": "loading_model"})
     emit({"type": "progress", "stage": "transcribing", "percent": 50})
@@ -114,7 +148,21 @@ def main() -> int:
             '</score-partwise>\n'
         )
     with open(os.path.join(out_dir, "result.json"), "w", encoding="utf-8") as fh:
-        json.dump({"durationSec": 1.0, "model": model}, fh)
+        if mode == "no-extras":
+            # Deliberately bare: the API must omit what the worker did not
+            # report, never fill the gaps itself.
+            json.dump({"model": model}, fh)
+        else:
+            json.dump(
+                {
+                    "durationSec": 1.0,
+                    "model": model,
+                    "detectedInstruments": FIXTURE_DETECTED_INSTRUMENTS,
+                    "tempoBpm": FIXTURE_TEMPO_BPM,
+                    "keyName": FIXTURE_KEY_NAME,
+                },
+                fh,
+            )
     emit({"type": "progress", "stage": "converting"})
     emit({"type": "result", "durationSec": 1.0, "model": model})
     return 0

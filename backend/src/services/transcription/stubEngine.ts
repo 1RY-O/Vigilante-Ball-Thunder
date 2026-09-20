@@ -9,6 +9,7 @@ import type {
   TranscribeRequest,
   TranscriptionEngine,
 } from './engine.js';
+import type { SheetType } from './sheetTypes.js';
 
 /**
  * ⚠️  MOCK ENGINE — TEST/DEVELOPMENT ONLY, NEVER REAL TRANSCRIPTION  ⚠️
@@ -38,6 +39,14 @@ const STUB_SEQUENCE = [
 export class StubEngine implements TranscriptionEngine {
   readonly name = 'stub';
   readonly isMock = true;
+  /**
+   * Honest capability declaration: the MOCK writes one fixed fixture and runs
+   * no music21, so it can only serve the default layout. A request for a
+   * richer layout on this engine is refused with 501 (`sheet-type-unsupported`)
+   * rather than being answered with a fixture that pretends to be a grand
+   * staff or a lead sheet.
+   */
+  readonly supportedSheetTypes: readonly SheetType[] = ['melody-chords'];
 
   async available(): Promise<EngineAvailability> {
     // The MOCK has no subprocess and no cache: it is always "available", and
@@ -63,6 +72,10 @@ export class StubEngine implements TranscriptionEngine {
       musicXmlPath,
       durationSec: 4.0,
       model: `stub-fixture (${req.model} requested; ignored by mock)`,
+      // Provenance is the mock's own label: no reader may mistake this for a
+      // real transcription, and no analysis is claimed (music21 never ran).
+      engineUsed: 'stub (MOCK fixture — synthetic data, not a real transcription)',
+      detectedInstruments: null,
     };
   }
 }

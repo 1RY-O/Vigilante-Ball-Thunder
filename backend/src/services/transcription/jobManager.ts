@@ -2,9 +2,13 @@ import {
   CancelledError,
   EmptyTranscriptionError,
   EngineUnavailableError,
+  NotImplementedError,
   TranscriptionError,
 } from './engine.js';
 import type { TranscriptionEngine } from './engine.js';
+import type { InstrumentHint } from './instrumentHints.js';
+import { instrumentGroupsForHint } from './instrumentHints.js';
+import type { SheetType } from './sheetTypes.js';
 import type { Job, JobError, JobResult, PublicStatus } from '../../types/job.js';
 import { newId } from '../../utils/id.js';
 import { safeMessage } from '../../utils/messages.js';
@@ -54,22 +58,30 @@ export class JobManager {
     this.sweeper = undefined;
   }
 
-  async createJob(model: string, uploadPath: string): Promise<Job> {
+  async createJob(opts: {
+    model: string;
+    sheetType: SheetType;
+    instrumentHint: InstrumentHint;
+    uploadPath: string;
+  }): Promise<Job> {
     const workDir = await makeIsolatedDir(this.uploadDir);
     const job: Job = {
       id: newId(),
       status: 'queued',
-      model,
+      model: opts.model,
+      sheetType: opts.sheetType,
+      instrumentHint: opts.instrumentHint,
       createdAt: Date.now(),
       startedAt: null,
       finishedAt: null,
       progress: { stage: 'queued' },
       result: null,
       error: null,
-      uploadPath,
+      uploadPath: opts.uploadPath,
       workDir,
       midiPath: null,
       musicXmlPath: null,
+      audioPath: null,
       abort: new AbortController(),
     };
     this.jobs.set(job.id, job);
@@ -80,6 +92,19 @@ export class JobManager {
 
   getJob(id: string): Job | undefined {
     return this.jobs.get(id);
+  }
+
+  /**
+   * Record a genuinely rendered playback file on a completed job. Only called
+   * after FluidSynth produced a readable WAV, so the public `audioUrl` is
+   * never advertised before the audio exists.
+   */
+  recordPlayback(id: string, audioPath: string): Job | undefined {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== 'complete' || !job.result) return undefined;
+    job.audioPath = audioPath;
+    job.result.audioUrl = `/api/artifacts/${encodeURIComponent(job.id)}/audio`;
+    return job;
   }
 
   /**
@@ -150,6 +175,8 @@ export class JobManager {
           audioPath: job.uploadPath,
           outDir: job.workDir,
           model: job.model,
+          sheetType: job.sheetType,
+          instrumentGroups: instrumentGroupsForHint(job.instrumentHint),
           signal: job.abort.signal,
         },
         (stage, percent) => {
@@ -160,16 +187,23 @@ export class JobManager {
           }
         },
       );
-      const resultUrls: JobResult = {
+      const finishedAt = Date.now();
+      const resultView: JobResult = {
         musicxmlUrl: `/api/artifacts/${encodeURIComponent(job.id)}/musicxml`,
         midiUrl: `/api/artifacts/${encodeURIComponent(job.id)}/midi`,
+        engineUsed: result.engineUsed,
+        durationSec: result.durationSec,
+        // Measured wall clock from job start to completion — never estimated.
+        transcriptionMs: finishedAt - job.startedAt,
+        detectedInstruments: result.detectedInstruments,
       };
-      job.result = resultUrls;
+      if (result.metadata) resultView.metadata = result.metadata;
+      job.result = resultView;
       job.midiPath = result.midiPath;
       job.musicXmlPath = result.musicXmlPath;
       job.status = 'complete';
       job.progress = { stage: 'done', percent: 100 };
-      job.finishedAt = Date.now();
+      job.finishedAt = finishedAt;
       await removeTree(job.uploadPath); // original audio no longer needed
     } catch (e) {
       await removeTree(job.uploadPath);
@@ -196,6 +230,11 @@ function toJobError(e: unknown): JobError {
       // e.code is a curated worker code (e.g. 'hf-token-missing'), safe to expose.
       cause: e.code,
     };
+  }
+  if (e instanceof NotImplementedError) {
+    // The engine ran; the requested transformation could not be produced.
+    // Reported honestly as not-implemented — never downgraded or padded.
+    return { code: 'not-implemented', message: safeMessage(e.message), cause: e.code };
   }
   if (e instanceof TranscriptionError) {
     return { code: 'transcription-failed', message: safeMessage(e.message) };

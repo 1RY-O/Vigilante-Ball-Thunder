@@ -8,6 +8,8 @@
  *    to transcribe anything.
  */
 
+import type { SheetType } from './sheetTypes.js';
+
 export const MIDI_FILENAME = 'transcription.mid';
 export const MUSICXML_FILENAME = 'transcription.musicxml';
 
@@ -15,7 +17,20 @@ export interface TranscribeRequest {
   audioPath: string;
   outDir: string;
   model: string;
+  /** Notation layout to produce (the worker post-processes the MIDI). */
+  sheetType: SheetType;
+  /**
+   * muscriptor instrument group names to allow (a HARD constraint), or an
+   * empty array for "no hint" — see instrumentHints.ts.
+   */
+  instrumentGroups: readonly string[];
   signal: AbortSignal;
+}
+
+/** Analysis the engine genuinely extracted from the produced artifact. */
+export interface EngineMetadata {
+  tempoBpm?: number;
+  keyName?: string;
 }
 
 export interface EngineResult {
@@ -23,6 +38,19 @@ export interface EngineResult {
   musicXmlPath: string;
   durationSec: number | null;
   model: string;
+  /**
+   * Truthful provenance of this result, stated by the engine itself, e.g.
+   * "muscriptor (small)" or the stub engine's MOCK label. Must never imply a
+   * real transcription for the mock engine.
+   */
+  engineUsed: string;
+  /**
+   * Instruments the engine actually decoded (its own output), or null when it
+   * cannot report them. Never inferred or guessed.
+   */
+  detectedInstruments: string[] | null;
+  /** Present only when at least one field was genuinely extracted. */
+  metadata?: EngineMetadata;
 }
 
 /**
@@ -63,6 +91,12 @@ export interface TranscriptionEngine {
   /** true ONLY for the mock/stub engine. Real engines are never mock. */
   readonly isMock: boolean;
   /**
+   * Sheet layouts this engine can GENUINELY produce. Requests for anything
+   * outside this list are refused with HTTP 501 (`sheet-type-unsupported`)
+   * instead of being silently downgraded to another layout.
+   */
+  readonly supportedSheetTypes: readonly SheetType[];
+  /**
    * Check whether the engine can actually run jobs right now.
    * `forceRefresh` bypasses the engine-internal cache (used by the background
    * availability monitor so a poll is always a real check). Callers that must
@@ -92,6 +126,23 @@ export class EmptyTranscriptionError extends TranscriptionError {
   constructor(message = 'No notes could be detected in this recording.') {
     super(message);
     this.name = 'EmptyTranscriptionError';
+  }
+}
+
+/**
+ * Raised when a requested transformation cannot be produced — either because
+ * the engine does not support it (pre-flight, e.g. the MOCK stub engine has no
+ * music21) or because the worker genuinely failed to build it (e.g. music21
+ * could not lay the decoded MIDI out as the requested sheet type). Maps to
+ * HTTP 501 with a curated code; never silently downgraded to another layout
+ * and never padded with invented content.
+ */
+export class NotImplementedError extends TranscriptionError {
+  readonly code: string;
+  constructor(message: string, code = 'not-implemented') {
+    super(message);
+    this.name = 'NotImplementedError';
+    this.code = code;
   }
 }
 

@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { FAKE_WORKER, makeTestApp, makeWav } from './helpers.js';
+import { FAKE_WORKER, makeTestApp, makeWav, waitForTerminal } from './helpers.js';
 import { MuScriptorEngine } from '../src/services/transcription/muScriptorEngine.js';
 import { buildContext } from '../src/appContext.js';
 import { createApp } from '../src/app.js';
@@ -95,6 +95,31 @@ describe('blocked MuScriptor is honest (no fabrication)', () => {
       expect(JSON.stringify(health.body)).not.toContain(token);
       const missing = await agent.get('/api/transcriptions/does-not-exist');
       expect(JSON.stringify(missing.body)).not.toContain(token);
+
+      // The token-bearing engine also runs a real job here: neither the job
+      // view nor any artifact/playback route may echo the secret.
+      const created = await agent
+        .post('/api/transcriptions')
+        .attach('file', makeWav(0.25), { filename: 'token.wav', contentType: 'audio/wav' })
+        .field('instrument', 'piano')
+        .field('sheetType', 'piano-grand');
+      expect(created.status).toBe(202);
+      const id = created.body.id as string;
+      const done = await waitForTerminal(agent, id);
+      expect(JSON.stringify(done.body)).not.toContain(token);
+
+      const bodies: unknown[] = [
+        (await agent.get(`/api/transcriptions/${id}`)).body,
+        (await agent.get(`/api/artifacts/${id}/musicxml`)).text,
+        (await agent.get(`/api/artifacts/${id}/midi`)).body,
+        (await agent.post(`/api/artifacts/${id}/playback`)).body,
+        (await agent.get(`/api/artifacts/${id}/audio`)).body,
+        (await agent.post('/api/transcriptions')).body,
+      ];
+      for (const body of bodies) {
+        expect(JSON.stringify(body)).not.toContain(token);
+        expect(String(body)).not.toMatch(/HF_TOKEN=/);
+      }
     } finally {
       await ctx.dispose();
       await fs.rm(tmpRoot, { recursive: true, force: true });

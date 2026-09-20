@@ -8,17 +8,21 @@ import {
   EngineUnavailableError,
   MIDI_FILENAME,
   MUSICXML_FILENAME,
+  NotImplementedError,
   SELF_CHECK_TIMEOUT_CODE,
   TranscriptionError,
   CancelledError,
 } from './engine.js';
 import type {
   EngineAvailability,
+  EngineMetadata,
   EngineResult,
   ProgressReporter,
   TranscribeRequest,
   TranscriptionEngine,
 } from './engine.js';
+import { SHEET_TYPES } from './sheetTypes.js';
+import type { SheetType } from './sheetTypes.js';
 
 /**
  * REAL engine: drives backend/python/transcribe_worker.py as a subprocess.
@@ -35,6 +39,14 @@ import type {
 export class MuScriptorEngine implements TranscriptionEngine {
   readonly name = 'muscriptor';
   readonly isMock = false;
+  /**
+   * The worker post-processes the decoded MIDI with music21, so every layout
+   * in the sheet-type vocabulary is genuinely produced: `melody-chords` writes
+   * the decoded part as-is, `piano-grand` splits it across a real two-staff
+   * piano part, `lead-sheet` reduces it to melody + identified chord symbols.
+   * See `backend/python/transcribe_worker.py` (render_musicxml / metadata).
+   */
+  readonly supportedSheetTypes: readonly SheetType[] = SHEET_TYPES;
 
   private readonly pythonBin: string;
   private readonly workerPath: string;
@@ -102,7 +114,13 @@ export class MuScriptorEngine implements TranscriptionEngine {
         '--audio', req.audioPath,
         '--out', req.outDir,
         '--model', req.model,
+        '--sheet-type', req.sheetType,
       ];
+      // Only sent when the request genuinely names instruments: muscriptor's
+      // --instruments is a hard constraint that forbids everything else.
+      if (req.instrumentGroups.length > 0) {
+        args.push('--instruments', req.instrumentGroups.join(','));
+      }
       const child = spawn(this.pythonBin, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: this.baseEnv,
@@ -204,14 +222,38 @@ export class MuScriptorEngine implements TranscriptionEngine {
     }
     let durationSec: number | null = null;
     let model = this.model;
+    let detectedInstruments: string[] | null = null;
+    let metadata: EngineMetadata | undefined;
     try {
       const raw = JSON.parse(await fs.readFile(path.join(outDir, 'result.json'), 'utf8')) as Record<string, unknown>;
       if (typeof raw['durationSec'] === 'number' && Number.isFinite(raw['durationSec'])) durationSec = raw['durationSec'];
       if (typeof raw['model'] === 'string' && raw['model']) model = raw['model'];
+      // Only the worker's own reported values are forwarded; anything missing
+      // or malformed stays null/absent rather than being guessed.
+      const detected = raw['detectedInstruments'];
+      if (Array.isArray(detected)) {
+        const names = detected.filter((v): v is string => typeof v === 'string' && v !== '');
+        if (names.length > 0) detectedInstruments = names;
+      }
+      const tempo = readFiniteNumber(raw['tempoBpm']);
+      const keyName = typeof raw['keyName'] === 'string' && raw['keyName'].trim() !== '' ? raw['keyName'] : undefined;
+      const extracted: EngineMetadata = {};
+      if (tempo !== undefined) extracted.tempoBpm = tempo;
+      if (keyName !== undefined) extracted.keyName = keyName;
+      if (Object.keys(extracted).length > 0) metadata = extracted;
     } catch {
       // result.json is informational; artifacts are what matters
     }
-    return { midiPath, musicXmlPath, durationSec, model };
+    const result: EngineResult = {
+      midiPath,
+      musicXmlPath,
+      durationSec,
+      model,
+      engineUsed: `${this.name} (${model})`,
+      detectedInstruments,
+    };
+    if (metadata) result.metadata = metadata;
+    return result;
   }
 
   /**
@@ -332,9 +374,17 @@ function mapFailure(failure: { code: string; message: string } | null): Error {
       return new EngineUnavailableError(failure.message, failure.code);
     case 'empty-transcription':
       return new EmptyTranscriptionError(failure.message);
+    case 'sheet-type-unsupported':
+      // The engine is fine; the requested layout genuinely could not be built.
+      return new NotImplementedError(failure.message, failure.code);
     default:
       return new TranscriptionError(failure.message);
   }
+}
+
+/** Strict finite-number reader: no coercion, no fallbacks. */
+function readFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 async function statOk(p: string): Promise<boolean> {

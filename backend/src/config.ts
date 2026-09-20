@@ -41,6 +41,20 @@ export interface Config {
    * yet known to be available. Polling stops once it is available.
    */
   warmupIntervalMs: number;
+  /**
+   * `fluidsynth` executable used by POST /api/artifacts/:id/playback. FluidSynth
+   * is an OS-level dependency (never an npm one); when it is missing the
+   * endpoint refuses honestly with `fluidsynth-missing`.
+   */
+  fluidsynthBin: string;
+  /**
+   * SoundFont (.sf2/.sf3) used to render MIDI → WAV. Empty string means "not
+   * configured/present": playback then refuses with `soundfont-missing` rather
+   * than synthesizing anything. Never guessed or downloaded silently.
+   */
+  soundfontPath: string;
+  /** Hard budget for one FluidSynth render (killed on timeout). */
+  playbackTimeoutMs: number;
   /** Only whether a token exists; the value is only forwarded to the worker. */
   hfTokenPresent: boolean;
 }
@@ -59,6 +73,23 @@ const int = (v: string | undefined, def: number): number => {
 function defaultPythonBin(): string {
   const venvPython = path.join(BACKEND_DIR, '.venv', 'bin', 'python');
   return fs.existsSync(venvPython) ? venvPython : 'python3';
+}
+
+/**
+ * SoundFont lookup for playback. No soundfont is bundled (the MuseScore
+ * General build is ~215 MB), and nothing is downloaded behind the operator's
+ * back: `SOUNDFONT_PATH` wins, otherwise a conventionally placed copy under
+ * backend/assets/soundfonts/ is used when it exists, otherwise playback
+ * honestly reports `soundfont-missing`.
+ */
+function defaultSoundfontPath(env: NodeJS.ProcessEnv): string {
+  const configured = env.SOUNDFONT_PATH?.trim();
+  if (configured) return configured;
+  const candidates = [
+    path.join(BACKEND_DIR, 'assets', 'soundfonts', 'MuseScore_General.sf2'),
+    path.join(BACKEND_DIR, 'assets', 'soundfonts', 'MuseScore_General.sf3'),
+  ];
+  return candidates.find((p) => fs.existsSync(p)) ?? '';
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -83,6 +114,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // 8GB machines; 30s used to abort a check that was merely slow.
     selfCheckTimeoutMs: int(env.MUSCRIPTOR_SELFCHECK_TIMEOUT_MS, 120_000),
     warmupIntervalMs: Math.max(1_000, int(env.MUSCRIPTOR_WARMUP_INTERVAL_MS, 30_000)),
+    fluidsynthBin: env.FLUIDSYNTH_BIN?.trim() || 'fluidsynth',
+    soundfontPath: defaultSoundfontPath(env),
+    playbackTimeoutMs: Math.max(1_000, int(env.PLAYBACK_TIMEOUT_MS, 120_000)),
     hfTokenPresent: !!env.HF_TOKEN && env.HF_TOKEN.trim() !== '',
   };
 }
