@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import DOMPurify from 'dompurify'
 import type { VerovioTimemap, VerovioToolkit } from 'verovio/esm'
 import { ENABLE_NOTE_HIGHLIGHTING } from './config'
+import type { NoteSpan } from './timeline'
 
 /**
  * Why the on-screen notation is missing. Reported so callers can log or
@@ -32,30 +33,10 @@ export const SCORE_RENDER_ERROR_TEXT = 'The notation could not be displayed for 
  */
 export const WASM_UNAVAILABLE_TEXT = 'This browser does not have WebAssembly enabled, which is required to engrave sheet music. On Cromite, you can enable it per-site via the lock icon → Site settings → JavaScript JIT. Alternatively, try a different browser.'
 
-/** One stretch of time during which a single note is sounding. */
-export interface NoteSpan { id: string; startMs: number; endMs: number }
-
 /** Sampling step used to turn Verovio's timemap into note spans. */
 export const TIMEMAP_STEP_MS = 50
 /** Safety cap, so a pathological score cannot make the scan run forever. */
 export const TIMEMAP_MAX_MS = 20 * 60 * 1000
-
-/**
- * The note sounding at `timeMs`, or null during a gap/rest. Spans are ordered
- * and contiguous, so this is a binary search for the last span that started.
- */
-export function activeNoteAt(spans: readonly NoteSpan[], timeMs: number): string | null {
-  let low = 0
-  let high = spans.length - 1
-  let found = -1
-  while (low <= high) {
-    const mid = (low + high) >> 1
-    const span = spans[mid]!
-    if (span.startMs <= timeMs) { found = mid; low = mid + 1 } else high = mid - 1
-  }
-  const span = found >= 0 ? spans[found] : undefined
-  return span && timeMs < span.endMs ? span.id : null
-}
 
 /** True when the span already open is the note sounding at this sample. */
 function isContinuing(open: NoteSpan | null, id: string): open is NoteSpan {

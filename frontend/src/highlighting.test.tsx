@@ -2,8 +2,9 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { expect, it, vi } from 'vitest'
 import type { VerovioToolkit } from 'verovio/esm'
 import Playback from './Playback'
-import ScoreViewer, { TIMEMAP_STEP_MS, activeNoteAt, buildTimeline } from './ScoreViewer'
-import type { NoteSpan } from './ScoreViewer'
+import ScoreViewer, { TIMEMAP_STEP_MS, buildTimeline } from './ScoreViewer'
+import { activeNoteAt } from './timeline'
+import type { NoteSpan } from './timeline'
 import { ENABLE_NOTE_HIGHLIGHTING } from './config'
 
 // The engraving engine is mocked; the counted `samples` value is what proves

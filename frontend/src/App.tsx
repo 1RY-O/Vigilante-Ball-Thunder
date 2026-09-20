@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react'
 import { capabilities, cancelJob, friendlyError, generatePlayback, getJob, getMusicXML, probeDurationSec, upload, validateDuration, validateFile, ServiceError } from './api'
 import type { Capabilities, EngineInfo, Result } from './api'
-import ScoreViewer, { activeNoteAt } from './ScoreViewer'
-import type { NoteSpan } from './ScoreViewer'
+import { activeNoteAt } from './timeline'
+import type { NoteSpan } from './timeline'
 import Playback from './Playback'
 import { ENABLE_NOTE_HIGHLIGHTING, PLAYBACK_GENERATION_ENABLED } from './config'
 import { DEFAULT_INSTRUMENT, DEFAULT_SHEET_TYPE, INSTRUMENT_OPTIONS, INSTRUMENT_OTHER, SHEET_TYPE_OPTIONS, SHEET_TYPE_SUPPORTED } from './options'
@@ -24,6 +24,9 @@ export function isEngineFailed(engine?: EngineInfo | null): boolean {
 }
 
 type Stage = 'idle' | 'selected' | 'uploading' | 'queued' | 'transcribing' | 'rendering' | 'complete' | 'error'
+// The engraving panel (plus its DOMPurify dependency) loads only once a score
+// exists to render — never in the initial bundle.
+const ScoreViewer = lazy(() => import('./ScoreViewer'))
 const labels: Record<Stage, string> = { idle: 'Ready for a recording', selected: 'Recording selected', uploading: 'Uploading recording', queued: 'Waiting for transcription', transcribing: 'Transcribing your recording', rendering: 'Engraving your sheet music', complete: 'Your score is ready', error: 'Something needs attention' }
 function wait(signal: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
@@ -153,14 +156,14 @@ export default function App() {
     setSelectionIssue(block ?? '')
     setError(block ?? '')
     operation.current?.abort()
-    setFile(file); setResult(null); setXml(''); setStage('selected'); setProgress(undefined)
+    setFile(file); setResult(null); setXml(''); setStage('selected'); setProgress(undefined); setTranscriptionMs(null)
   }
   async function transcribe() {
     if (!file || !caps || busy || engineBlocked || selectionIssue) return
     operation.current?.abort()
     const controller = new AbortController()
     operation.current = controller
-    setError(''); setResult(null); setXml(''); setStage('uploading'); setProgress(undefined)
+    setError(''); setResult(null); setXml(''); setStage('uploading'); setProgress(undefined); setTranscriptionMs(null)
     const started = performance.now()
     try {
       let job = await upload(file, controller.signal, setProgress, {
@@ -264,7 +267,7 @@ export default function App() {
         </section>
         <section className="manuscript" aria-labelledby="score-title" aria-busy={stage === 'rendering'}><div className="section-heading manuscript-heading"><span className="section-number">02</span><h2 id="score-title">Your manuscript</h2>{stage === 'complete' && !scoreFailed && <span className="ready-badge">Ready to read</span>}</div>
           {ENABLE_NOTE_HIGHLIGHTING && highlightedNote && <p className="sr-only" aria-live="polite">Following the highlighted note.</p>}
-          {xml ? <><div className="score-titlebar"><span className="score-filename" title={file?.name ?? 'Transcription'}>{file?.name ?? 'Transcription'}</span>{metadataKey && <span className="score-attr">Key {metadataKey}</span>}{metadataTempo != null && <span className="score-attr">{formatTempoBpm(metadataTempo)}</span>}</div><ScoreViewer xml={xml} onReady={ready} onRenderFailure={handleRenderFailure} activeNoteId={activeNoteId} onNoteHighlight={handleNoteHighlight} onTimelineChange={handleTimelineChange} /></> : <div className="empty-score"><svg className="empty-illustration" aria-hidden="true" viewBox="0 0 120 72" width="120" height="72"><g stroke="#d9cdaa" strokeWidth="1.5">{[18, 26, 34, 42, 50].map(y => <line key={y} x1="8" y1={y} x2="112" y2={y} />)}</g><g fill="#6f6136"><ellipse cx="34" cy="38" rx="6" ry="4.5" transform="rotate(-20 34 38)" /><rect x="38.5" y="10" width="2.4" height="29" rx="1" /><ellipse cx="82" cy="30" rx="6" ry="4.5" transform="rotate(-20 82 30)" /><rect x="86.5" y="2" width="2.4" height="29" rx="1" /></g><path d="M41 10 q10 3 10 12" fill="none" stroke="#6f6136" strokeWidth="1.5" /></svg><p className="eyebrow">A LITTLE SPACE FOR YOUR NEXT MELODY</p><h3>{stage === 'rendering' ? 'Preparing your manuscript…' : 'Your score starts with a sound.'}</h3><p>Once your recording is transcribed,<br />your sheet music will appear here.</p><div className="empty-divider" /><small>Staff notation · Playback · MIDI & MusicXML</small></div>}
+          {xml ? <><div className="score-titlebar"><span className="score-filename" title={file?.name ?? 'Transcription'}>{file?.name ?? 'Transcription'}</span>{metadataKey && <span className="score-attr">Key {metadataKey}</span>}{metadataTempo != null && <span className="score-attr">{formatTempoBpm(metadataTempo)}</span>}</div><Suspense fallback={<div className="score-tools"><span className="pulse">Engraving your manuscript…</span></div>}><ScoreViewer xml={xml} onReady={ready} onRenderFailure={handleRenderFailure} activeNoteId={activeNoteId} onNoteHighlight={handleNoteHighlight} onTimelineChange={handleTimelineChange} /></Suspense></> : <div className="empty-score"><svg className="empty-illustration" aria-hidden="true" viewBox="0 0 120 72" width="120" height="72"><g stroke="#d9cdaa" strokeWidth="1.5">{[18, 26, 34, 42, 50].map(y => <line key={y} x1="8" y1={y} x2="112" y2={y} />)}</g><g fill="#6f6136"><ellipse cx="34" cy="38" rx="6" ry="4.5" transform="rotate(-20 34 38)" /><rect x="38.5" y="10" width="2.4" height="29" rx="1" /><ellipse cx="82" cy="30" rx="6" ry="4.5" transform="rotate(-20 82 30)" /><rect x="86.5" y="2" width="2.4" height="29" rx="1" /></g><path d="M41 10 q10 3 10 12" fill="none" stroke="#6f6136" strokeWidth="1.5" /></svg><p className="eyebrow">A LITTLE SPACE FOR YOUR NEXT MELODY</p><h3>{stage === 'rendering' ? 'Preparing your manuscript…' : 'Your score starts with a sound.'}</h3><p>Once your recording is transcribed,<br />your sheet music will appear here.</p><div className="empty-divider" /><small>Staff notation · Playback · MIDI & MusicXML</small></div>}
           {result && <><div className="exports"><div><h3>Keep making music</h3><p>Open your score in your favourite music editor.</p></div><div className="export-buttons"><a className="button" href={result.midiUrl} download="transcription.mid">↓ Download MIDI</a><a className="button" href={result.musicxmlUrl} download="transcription.musicxml">↓ Download MusicXML</a></div></div><div className="result-meta" aria-label="Transcription details">{metadataEngine && <span className="meta-item"><span className="meta-label">Engine</span> <strong>{metadataEngine}</strong></span>}{metadataModel && <span className="meta-item"><span className="meta-label">Model</span> <strong>{metadataModel}</strong></span>}{metadataInstruments && <span className="meta-item"><span className="meta-label">Instruments</span> <strong>{metadataInstruments.join(', ')}</strong></span>}{metadataTempo != null && <span className="meta-item"><span className="meta-label">Tempo</span> <strong>{formatTempoBpm(metadataTempo)}</strong></span>}{metadataKey && <span className="meta-item"><span className="meta-label">Key</span> <strong>{metadataKey}</strong></span>}{metadataDuration != null && <span className="meta-item"><span className="meta-label">Duration</span> <strong>{formatDurationSec(metadataDuration)}</strong></span>}{metadataTranscriptionMs != null && <span className="meta-item"><span className="meta-label">Transcription time</span> <strong>{formatDurationSec(Math.ceil(metadataTranscriptionMs / 1000))}</strong></span>}</div>{PLAYBACK_GENERATION_ENABLED && <div className="exports playback-generation"><div><h3>Score-aligned playback</h3><p>Generate audio that follows your transcribed notation instead of the original recording.</p></div><button className="button" disabled={generatingPlayback || !!result.audioUrl} onClick={startGeneratedPlayback}>{generatingPlayback ? 'Generating…' : result.audioUrl ? 'Playback ready ✓' : 'Generate playback'}</button></div>}{(result.audioUrl || source) && <Playback src={result.audioUrl || source} generated={!!result.audioUrl} onTimeMs={ENABLE_NOTE_HIGHLIGHTING ? setTimeMs : undefined} />}</>}
         </section>
       </div>
