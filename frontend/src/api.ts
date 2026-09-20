@@ -2,7 +2,24 @@ import { formatBytes, formatDurationSec } from './format'
 
 export interface EngineInfo { name?: string; mock?: boolean; available?: boolean; checking?: boolean; code?: string; reason?: string; model?: string }
 export interface Capabilities { formats: string[]; maxUploadBytes: number; engine?: EngineInfo; maxAudioDurationSec?: number }
-export interface Result { musicxmlUrl: string; midiUrl: string; audioUrl?: string }
+/** Audio analysis the backend genuinely extracted (music21 reading the real
+ *  transcription). A field the engine could not read is absent — never guessed. */
+export interface ResultMeta { tempoBpm?: number; keyName?: string }
+export interface Result {
+  musicxmlUrl: string
+  midiUrl: string
+  audioUrl?: string
+  /** Engine + model that produced this result, e.g. "muscriptor (small)". */
+  engineUsed?: string
+  /** Audio duration reported by the engine, or null when it did not. */
+  durationSec?: number | null
+  /** Measured wall clock from job start to completion (ms). */
+  transcriptionMs?: number
+  /** Instruments the engine actually decoded, or null when it did not report any. */
+  detectedInstruments?: string[] | null
+  /** Tempo/key, only when the engine genuinely extracted them. */
+  metadata?: ResultMeta
+}
 export interface Job { id: string; status: 'queued' | 'transcribing' | 'complete' | 'error'; progress?: number; result?: Result; error?: { code: string; message: string; cause?: string } }
 // Curated failure codes the backend may attach to a job; a message is only
 // surfaced when its code is one of these, so a misbehaving backend can never
@@ -78,6 +95,25 @@ export function parseJob(value: unknown): Job {
   if (data.status === 'complete') {
     if (!data.result) throw new ServiceError('The score is missing from the result. Please try again.')
     job.result = { musicxmlUrl: artifactUrl(data.result.musicxmlUrl), midiUrl: artifactUrl(data.result.midiUrl), ...(data.result.audioUrl ? { audioUrl: artifactUrl(data.result.audioUrl) } : {}) }
+    // Richer metadata is copied only when genuinely present and well-formed;
+    // anything missing or malformed is omitted, never invented. (Backend
+    // contract: backend/CHANGES_REQUESTED.md 2026-09-20.)
+    const raw = data.result as unknown as Record<string, unknown>
+    if (typeof raw.engineUsed === 'string' && raw.engineUsed) job.result.engineUsed = raw.engineUsed
+    if (typeof raw.durationSec === 'number' && Number.isFinite(raw.durationSec) && raw.durationSec >= 0) job.result.durationSec = raw.durationSec
+    else if (raw.durationSec === null) job.result.durationSec = null
+    if (typeof raw.transcriptionMs === 'number' && Number.isFinite(raw.transcriptionMs) && raw.transcriptionMs >= 0) job.result.transcriptionMs = Math.round(raw.transcriptionMs)
+    if (Array.isArray(raw.detectedInstruments)) {
+      const names = raw.detectedInstruments.filter((v): v is string => typeof v === 'string' && v !== '')
+      job.result.detectedInstruments = names.length ? names : null
+    } else if (raw.detectedInstruments === null) job.result.detectedInstruments = null
+    if (raw.metadata && typeof raw.metadata === 'object') {
+      const meta = raw.metadata as Record<string, unknown>
+      const out: ResultMeta = {}
+      if (typeof meta.tempoBpm === 'number' && Number.isFinite(meta.tempoBpm) && meta.tempoBpm > 0) out.tempoBpm = meta.tempoBpm
+      if (typeof meta.keyName === 'string' && meta.keyName.trim()) out.keyName = meta.keyName.trim()
+      if (Object.keys(out).length) job.result.metadata = out
+    }
   }
   if (data.status === 'error') {
     const err = (data as { error?: unknown }).error as { code?: unknown; message?: unknown } | undefined

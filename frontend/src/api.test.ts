@@ -64,6 +64,37 @@ describe('API boundary', () => {
     expect(() => parseJob({ id: '1', status: 'complete' })).toThrow()
     expect(() => parseJob({ id: '1', status: 'invented' })).toThrow()
   })
+  it('copies result metadata only when genuinely present and well-formed', () => {
+    const result = parseJob({ id: '1', status: 'complete', result: {
+      musicxmlUrl: '/api/files/score', midiUrl: '/api/files/midi',
+      engineUsed: 'muscriptor (small)', durationSec: 4.5, transcriptionMs: 834.4,
+      detectedInstruments: ['acoustic_piano'], metadata: { tempoBpm: 123, keyName: 'C major' },
+    } }).result!
+    expect(result.engineUsed).toBe('muscriptor (small)')
+    expect(result.durationSec).toBe(4.5)
+    expect(result.transcriptionMs).toBe(834)
+    expect(result.detectedInstruments).toEqual(['acoustic_piano'])
+    expect(result.metadata).toEqual({ tempoBpm: 123, keyName: 'C major' })
+  })
+  it('omits malformed or absent result metadata instead of inventing it', () => {
+    const result = parseJob({ id: '1', status: 'complete', result: {
+      musicxmlUrl: '/api/files/score', midiUrl: '/api/files/midi',
+      engineUsed: '', durationSec: 'soon', transcriptionMs: NaN,
+      detectedInstruments: ['ok', 42, ''], metadata: { tempoBpm: -3, keyName: '  ' },
+    } }).result!
+    expect(result).not.toHaveProperty('engineUsed')
+    expect(result).not.toHaveProperty('durationSec')
+    expect(result).not.toHaveProperty('transcriptionMs')
+    // Valid entries survive; garbage entries are dropped, not kept.
+    expect(result.detectedInstruments).toEqual(['ok'])
+    expect(result).not.toHaveProperty('metadata')
+    const bare = parseJob({ id: '1', status: 'complete', result: {
+      musicxmlUrl: '/api/files/score', midiUrl: '/api/files/midi',
+      detectedInstruments: [42, ''], metadata: {},
+    } }).result!
+    expect(bare.detectedInstruments).toBeNull()
+    expect(bare).not.toHaveProperty('metadata')
+  })
   it.each(['https://example.com/secret', 'javascript:alert(1)', '/api/../../secret', '//evil.test/a'])('rejects unsafe artifact URL %s', url => { expect(() => artifactUrl(url)).toThrow() })
   it('rejects malformed notation', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('<html>not music</html>')))

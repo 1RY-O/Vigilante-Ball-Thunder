@@ -38,6 +38,8 @@ test('upload → server states → real notation → playback and both exports',
   await page.setViewportSize({ width: 390, height: 844 })
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
   await page.screenshot({ path: testInfo.outputPath('mobile-result.png'), fullPage: true })
+  await page.setViewportSize({ width: 320, height: 568 })
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
   expect(errors).toEqual([])
 })
 test('cancel mid-polling stops cleanly and asks the service to cancel', async ({ page }) => {

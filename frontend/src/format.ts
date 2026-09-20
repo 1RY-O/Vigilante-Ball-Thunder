@@ -20,3 +20,9 @@ export function formatDurationSec(totalSec: number): string {
   const seconds = String(whole % 60).padStart(2, '0')
   return `${minutes}:${seconds}`
 }
+
+/** "123 BPM" — integral when the value is integral, one decimal otherwise. */
+export function formatTempoBpm(bpm: number): string {
+  const shown = Number.isInteger(bpm) ? String(bpm) : bpm.toFixed(1)
+  return `${shown} BPM`
+}

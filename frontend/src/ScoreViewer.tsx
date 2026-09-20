@@ -176,7 +176,7 @@ export default function ScoreViewer({ xml, onReady, onRenderFailure, activeNoteI
     next?.classList.add('playing')
   }, [activeNoteId, pages])
   return <>
-    <div className="score-tools"><span>{pages.length ? `${pages.length} ${pages.length === 1 ? 'page' : 'pages'} · MusicXML notation` : failure ? 'Notation unavailable' : 'Engraving your manuscript…'}</span><div className="zoom"><button aria-label="Zoom out" disabled={zoom <= 60} onClick={() => setZoom(z => z - 10)}>−</button><output aria-label="Zoom level">{zoom}%</output><button aria-label="Zoom in" disabled={zoom >= 160} onClick={() => setZoom(z => z + 10)}>+</button></div></div>
+    <div className="score-tools"><span className={pages.length || failure ? undefined : 'pulse'}>{pages.length ? `${pages.length} ${pages.length === 1 ? 'page' : 'pages'} · MusicXML notation` : failure ? 'Notation unavailable' : 'Engraving your manuscript…'}</span><div className="zoom"><button aria-label="Zoom out" disabled={zoom <= 60} onClick={() => setZoom(z => z - 10)}>−</button><output aria-label="Zoom level">{zoom}%</output><button aria-label="Zoom in" disabled={zoom >= 160} onClick={() => setZoom(z => z + 10)}>+</button></div></div>
     <div className="score-scroll" ref={scroll} tabIndex={0} aria-label="Sheet music pages">
       {failure && <p className="score-error" role="alert" data-render-failure={failure}>{failure === 'wasm-unavailable' ? WASM_UNAVAILABLE_TEXT : SCORE_RENDER_ERROR_TEXT}</p>}
       {pages.map((svg, i) => <div className="score-page" key={i} style={{ width: `${840 * zoom / 100}px` }} role="img" aria-label={`Sheet music, page ${i + 1}`} dangerouslySetInnerHTML={{ __html: svg }} />)}

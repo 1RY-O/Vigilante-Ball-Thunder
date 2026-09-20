@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { it, expect, vi } from 'vitest'
 import App from './App'
 import Playback from './Playback'
@@ -250,4 +250,59 @@ it('keeps the generate-playback action hidden until the backend supports it', as
   xhr.onload(); xhr.onloadend()
   expect(await screen.findByText('Keep making music', {}, { timeout: 8000 })).toBeInTheDocument()
   expect(screen.queryByRole('button', { name: /Generate playback/ })).not.toBeInTheDocument()
+}, 20000)
+it('shows backend-provided instruments, tempo and key, preferring server measurements', async () => {
+  const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+    if (url === '/api/capabilities') return Response.json({ formats: ['mp3', 'wav', 'flac'], maxUploadBytes: 1024 * 1024, maxAudioDurationSec: 600, engine: { name: 'stub', mock: true, available: true } })
+    if (url === '/api/transcriptions/job-1') return Response.json({ id: 'job-1', status: 'complete', progress: 100, result: {
+      musicxmlUrl: '/api/artifacts/job-1/musicxml', midiUrl: '/api/artifacts/job-1/midi',
+      engineUsed: 'muscriptor (small)', durationSec: 4.5, transcriptionMs: 834,
+      detectedInstruments: ['acoustic_piano'], metadata: { tempoBpm: 123, keyName: 'C major' },
+    } })
+    return new Response(MUSIC_XML, { status: 200, headers: { 'Content-Type': 'application/vnd.recordare.musicxml+xml' } })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  const xhr = { open: vi.fn(), upload: {} as { onprogress: (e: object) => void }, send: vi.fn(), abort: vi.fn(), status: 202, responseText: '{"id":"job-1","status":"queued"}', onload: () => {}, onloadend: () => {} }
+  vi.stubGlobal('XMLHttpRequest', class { constructor() { return xhr } })
+  vi.stubGlobal('URL', Object.assign(URL, { createObjectURL: vi.fn(() => 'blob:recording'), revokeObjectURL: vi.fn() }))
+  stubAudioDecoder(30)
+  const { container } = render(<App />)
+  const input = screen.getByLabelText('Choose audio recording')
+  await waitFor(() => expect(input).toBeEnabled())
+  fireEvent.change(input, { target: { files: [new File(['audio'], 'melody.wav')] } })
+  await screen.findByText('Recording selected')
+  fireEvent.click(screen.getByRole('button', { name: 'Create sheet music' }))
+  xhr.onload(); xhr.onloadend()
+  const details = await screen.findByLabelText('Transcription details', {}, { timeout: 8000 })
+  // Server-measured values win: the client's 30s probe is replaced by 4s.
+  expect(within(details).getByText('muscriptor (small)')).toBeInTheDocument()
+  expect(within(details).getByText('acoustic_piano')).toBeInTheDocument()
+  expect(within(details).getByText('123 BPM')).toBeInTheDocument()
+  expect(within(details).getByText('C major')).toBeInTheDocument()
+  expect(within(details).getByText('4s')).toBeInTheDocument()
+  expect(within(details).queryByText('30s')).not.toBeInTheDocument()
+  // The score title bar names the file and repeats the returned key/tempo.
+  const titlebar = container.querySelector('.score-titlebar')!
+  expect(titlebar.textContent).toContain('melody.wav')
+  expect(titlebar.textContent).toContain('C major')
+  expect(titlebar.textContent).toContain('123 BPM')
+}, 20000)
+it('shows indeterminate progress without real values and the real percentage with them', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ formats: ['mp3', 'wav', 'flac'], maxUploadBytes: 1024 * 1024, maxAudioDurationSec: 600, engine: { name: 'stub', mock: true, available: true } })))
+  const xhr = { open: vi.fn(), upload: {} as { onprogress: (e: object) => void }, send: vi.fn(), abort: vi.fn(), status: 202, responseText: '{"id":"job-1","status":"queued"}', onload: () => {}, onloadend: () => {} }
+  vi.stubGlobal('XMLHttpRequest', class { constructor() { return xhr } })
+  vi.stubGlobal('URL', Object.assign(URL, { createObjectURL: vi.fn(() => 'blob:recording'), revokeObjectURL: vi.fn() }))
+  stubAudioDecoder(30)
+  render(<App />)
+  const input = screen.getByLabelText('Choose audio recording')
+  await waitFor(() => expect(input).toBeEnabled())
+  fireEvent.change(input, { target: { files: [new File(['audio'], 'melody.wav')] } })
+  await screen.findByText('Recording selected')
+  fireEvent.click(screen.getByRole('button', { name: 'Create sheet music' }))
+  // No byte counts yet: an indeterminate indicator, never a fake percentage.
+  const bar = await screen.findByRole('progressbar', { name: 'Uploading recording' })
+  expect(bar).not.toHaveAttribute('value')
+  // Real upload events drive the real percentage.
+  xhr.upload.onprogress({ lengthComputable: true, loaded: 1, total: 2 })
+  expect(await screen.findByRole('progressbar', { name: 'Uploading recording' })).toHaveAttribute('value', '50')
 }, 20000)
