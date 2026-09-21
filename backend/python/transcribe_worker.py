@@ -367,11 +367,197 @@ def render_musicxml(score, xml_path: str, sheet_type: str) -> None:
 
 
 
+# EXPERIMENT 2, Step 1 (memory): streaming per-tensor weight loader.
+#
+# TranscriptionModel.load_model() materializes the whole fp32 state dict
+# (load_file) next to the fp32 model before casting to the target dtype, so
+# ~393 MB of weights sit in RAM twice at the load peak. The loader below
+# reaches the identical end state while values stream one tensor at a time:
+# same source resolution, same cached download, same _build_model config,
+# same legacy key remap, same exact key-set match, per-tensor shape checks
+# from load_state_dict itself, same conditioner-fp32 restore, same eval /
+# tokenizer / constructor. Only lower-precision dtypes use it; "float32"
+# keeps the original TranscriptionModel.load_model() call untouched.
+# Revert: delete everything up to `def main`, the --dtype arg, and the
+# dispatch branch (restore `model = TranscriptionModel.load_model(args.model)`).
+def _build_for_streaming(cfg, device, target):
+    """Model at the target dtype, preferably without ever holding fp32 params.
+
+    Meta-device path: construct on meta (no storage), cast meta->meta
+    (free), materialize uninitialized storage at the target dtype with
+    to_empty. Every key is then filled from the weight file, so the
+    uninitialized memory never survives: the upfront exact key-set match
+    plus per-tensor shape checks plus the finiteness audit make a silent
+    gap impossible. Any failure here (or below) falls back to the plain
+    build + cast, which is exactly what load_model does today.
+    """
+    import torch
+    from muscriptor.transcription_model import _build_model
+
+    try:
+        model = _build_model(torch.device("meta"), cfg)
+        model.to(target)
+        model.to_empty(device=device)
+        for _, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+            if tensor.is_meta:
+                raise RuntimeError("meta tensor survived to_empty")
+        # Conditioners stash the build device as a plain attribute and move
+        # audio onto it at runtime (wav.to(self.device) in tokenize). A meta
+        # device stored here would leak into inference, so point every such
+        # attribute at the real device; the audit below verifies none remain.
+        for module in model.modules():
+            stored = getattr(module, "device", None)
+            try:
+                is_meta_device = isinstance(stored, torch.device) and stored.type == "meta"
+            except Exception:
+                is_meta_device = False
+            if is_meta_device:
+                module.device = device
+        print("[worker] streaming load: meta-device build ok", file=sys.stderr)
+        return model, True
+    except Exception as exc:
+        print(
+            f"[worker] streaming load: meta-device build unavailable "
+            f"({exc.__class__.__name__}), using plain build",
+            file=sys.stderr,
+        )
+        model = _build_model(device, cfg)
+        if target != torch.float32:
+            model.to(target)
+        return model, False
+
+
+def _audit_streamed_model(model, target, used_meta) -> None:
+    """Fail loudly unless every floating tensor has its intended dtype/values.
+
+    Transformer params must be `target`; the conditioning pipeline (mel,
+    class embeddings, buffers) must be fp32, exactly as load_model leaves
+    them. All values must be finite — with the meta path this also proves
+    no uninitialized storage survived the load.
+    """
+    import torch
+
+    bad_dtype: list[str] = []
+    nonfinite: list[str] = []
+    meta_devices: list[str] = []
+    for module_name, module in model.named_modules():
+        stored = getattr(module, "device", None)
+        if isinstance(stored, torch.device) and stored.type == "meta":
+            meta_devices.append(module_name or type(module).__name__)
+    tensors = list(model.named_parameters()) + [
+        (name, buf) for name, buf in model.named_buffers() if buf.is_floating_point()
+    ]
+    for name, tensor in tensors:
+        want = torch.float32 if name.startswith("condition_provider.") else target
+        if tensor.dtype != want:
+            bad_dtype.append(f"{name} is {tensor.dtype}, want {want}")
+        if not torch.isfinite(tensor).all().item():
+            nonfinite.append(name)
+    print(
+        f"[worker] streaming load: audit meta={used_meta} "
+        f"target={str(target).replace('torch.', '')} "
+        f"tensors={len(tensors)} bad_dtype={len(bad_dtype)} "
+        f"nonfinite={len(nonfinite)} meta_devices={len(meta_devices)}",
+        file=sys.stderr,
+    )
+    if bad_dtype or nonfinite or meta_devices:
+        for line in (bad_dtype + [f"non-finite: {n}" for n in nonfinite])[:8]:
+            print(f"[worker] streaming load: {line}", file=sys.stderr)
+        raise fail("transcription-failed", "Loaded weights failed integrity audit.", 3)
+
+
+def _load_model_streaming(size: str, dtype_name: str):
+    """Mirror of TranscriptionModel.load_model() with a streaming value load."""
+    import torch
+    import muscriptor.accelerator
+    from muscriptor import TranscriptionModel
+    from muscriptor.tokenizer.mt3 import MT3Tokenizer
+    from muscriptor.transcription_model import (
+        _remap_single_codebook_keys,
+        _resolve_config,
+        _resolve_source,
+    )
+    from muscriptor.utils.download import download_if_necessary
+    from safetensors import safe_open
+
+    target = getattr(torch, dtype_name)
+    # Same device policy as load_model: accelerator when one exists, else CPU.
+    device = (
+        muscriptor.accelerator.current_accelerator()
+        if muscriptor.accelerator.is_available()
+        else torch.device("cpu")
+    )
+    source = _resolve_source(size)
+    weights_path = download_if_necessary(source)  # cached read; never rewritten
+    model, used_meta = _build_for_streaming(_resolve_config(source, weights_path), device, target)
+    model.eval()
+
+    # Strict key validation up front, header-only (no values faulted).
+    # _remap_single_codebook_keys is the package's own remap, reused on
+    # key-only entries so legacy names and the multi-codebook rejection
+    # behave exactly as in load_model.
+    with safe_open(weights_path, framework="pt", device=str(device)) as reader:
+        header_keys = list(reader.keys())
+    remapped_names: list[str] = []
+    for key in header_keys:
+        (name,) = _remap_single_codebook_keys({key: None}).keys()
+        remapped_names.append(name)
+    expected = set(model.state_dict().keys())
+    missing = sorted(expected - set(remapped_names))
+    unexpected = sorted(set(remapped_names) - expected)
+    if missing or unexpected:
+        raise fail(
+            "transcription-failed",
+            f"Weight file keys do not match the model "
+            f"(missing={len(missing)}, unexpected={len(unexpected)}).",
+            3,
+        )
+
+    # Stream values one tensor at a time with the pread backend (anonymous
+    # per-tensor allocations, no whole-file mmap residency). load_state_dict
+    # checks each shape as it copies, casting fp32 file values into the
+    # pre-cast model exactly as Module.to() would.
+    with safe_open(weights_path, framework="pt", device=str(device), backend="pread") as reader:
+        for key, name in zip(header_keys, remapped_names):
+            value = reader.get_tensor(key)
+            if target != torch.float32:
+                value = value.to(target)
+            try:
+                model.load_state_dict({name: value}, strict=False)
+            except Exception as exc:
+                raise fail(
+                    "transcription-failed",
+                    f"Weight '{name}' does not fit the model ({exc.__class__.__name__}).",
+                    3,
+                ) from exc
+            del value
+    # Same conditioner-fp32 restore as load_model.
+    if target != torch.float32:
+        model.condition_provider.float()
+    _audit_streamed_model(model, target, used_meta)
+
+    tokenizer = MT3Tokenizer(
+        instrument_vocabulary="MT3_FULL_PLUS",
+        max_shift_steps=1001,
+    )
+    return TranscriptionModel(model=model, tokenizer=tokenizer, device=device)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="MuScriptor transcription worker")
     parser.add_argument("--audio", help="Input audio path (wav/mp3/flac)")
     parser.add_argument("--out", help="Output directory for artifacts")
     parser.add_argument("--model", default="small", choices=["small", "medium", "large"])
+    # EXPERIMENT 2, Step 1 (memory): opt-in transformer dtype. "float32" keeps
+    # the original load path; any other choice routes through the streaming
+    # per-tensor loader above. Set via MUSCRIPTOR_DTYPE so the RAM harness
+    # (which passes no extra flags) can trial it with zero harness changes.
+    parser.add_argument(
+        "--dtype",
+        default=os.environ.get("MUSCRIPTOR_DTYPE", "float32"),
+        choices=["float32", "float16", "bfloat16"],
+        help="Transformer weight/compute dtype (default: float32)",
+    )
     parser.add_argument("--instruments", default=None, help="Comma-separated instrument restricts (optional)")
     parser.add_argument(
         "--sheet-type",
@@ -395,7 +581,10 @@ def main() -> int:
         emit({"type": "progress", "stage": "loading_model"})
         from muscriptor import TranscriptionModel
 
-        model = TranscriptionModel.load_model(args.model)
+        if args.dtype == "float32":
+            model = TranscriptionModel.load_model(args.model)
+        else:
+            model = _load_model_streaming(args.model, args.dtype)
 
         emit({"type": "progress", "stage": "transcribing"})
         midi_path = os.path.join(args.out, "transcription.mid")
