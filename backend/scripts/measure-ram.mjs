@@ -53,6 +53,9 @@ const MAX_GEN_LEN = argOf('--max-gen-len', null);
 const TAG = argOf('--tag', '');
 // EXPERIMENT KV Phase B (Medium): --model sets MUSCRIPTOR_MODEL for the server.
 const MODEL = argOf('--model', null);
+// Audio-lifetime probe (explicit, auditable; unset = production behavior):
+// --beat-grid off  -> MUSCRIPTOR_BEAT_GRID=off (skip beat_this)
+const BEAT_GRID = argOf('--beat-grid', null);
 
 // ---- /proc sampling ----
 function readStatusField(pid, field) {
@@ -146,6 +149,19 @@ function parseWorkerTiming(text) {
   while ((m = reTokSum.exec(text)) !== null) {
     out.push({ kind: 'tokens-summary', chunks: Number(m[1]), maxSteps: Number(m[2]), hitCap: Number(m[3]), totalSteps: Number(m[4]) });
   }
+  // Audio-lifetime profiling: phase-stamped RSS lines.
+  //   [worker-phase] post-load rssKb=123
+  //   [worker-phase] beat-grid skipped (MUSCRIPTOR_BEAT_GRID=off)
+  const rePhase = /\[worker-phase\]\s+(gc:)?([A-Za-z0-9-]+)(?:\s+collected=(\d+))?\s+rssKb=(\S+)/g;
+  while ((m = rePhase.exec(text)) !== null) {
+    out.push({
+      kind: 'phase',
+      gc: m[1] ? true : false,
+      phase: m[2],
+      collected: m[3] !== undefined ? Number(m[3]) : null,
+      rssKb: m[4] === 'n/a' ? null : Number(m[4]),
+    });
+  }
   return out;
 }
 
@@ -229,6 +245,7 @@ async function main() {
   };
   if (MAX_GEN_LEN !== null) env.MUSCRIPTOR_MAX_GEN_LEN = String(MAX_GEN_LEN);
   if (MODEL !== null) env.MUSCRIPTOR_MODEL = String(MODEL);
+  if (BEAT_GRID !== null) env.MUSCRIPTOR_BEAT_GRID = String(BEAT_GRID);
   const server = spawn('node', ['dist/index.js'], { cwd: BACKEND, env, stdio: ['ignore', 'pipe', 'pipe'] });
   const errTail = [];
   // PHASE 0: full stderr buffer for [worker-mem] parsing (tail kept for log).
@@ -359,6 +376,9 @@ async function main() {
     report.workerSelfPeakHwmKb = selfHwm.length ? Math.max(...selfHwm) : null;
     // PHASE 1A (additive): timing + audit lines forwarded on server stderr.
     report.workerTimings = workerTimings;
+    // Audio-lifetime profiling (additive): phase-stamped RSS trajectory.
+    report.workerPhases = workerTimings.filter((e) => e.kind === 'phase');
+    report.beatGridEnv = env.MUSCRIPTOR_BEAT_GRID ?? null;
     report.loaderEnv = env.MUSCRIPTOR_LOADER ?? null;
     report.dtypeEnv = env.MUSCRIPTOR_DTYPE ?? null;
     // EXPERIMENT KV (additive): cap + fixture identity for the sweep table.
@@ -386,8 +406,12 @@ async function main() {
   console.log(`peak python child HWM:    ${kb(report.peakChildHwmKb)}`);
   console.log(`peak child retained:      ${kb(report.peakChildRetainedKb)}`);
   console.log(`peak total w/ child HWM:  ${kb(report.peakTotalWithChildHwmKb)}`);
-  console.log(`worker self peak RSS:     ${kb(report.workerSelfPeakRssKb)} (${report.workerSelfPeakCount ?? 0} report(s))`);
-  console.log(`worker self peak HWM:     ${kb(report.workerSelfPeakHwmKb)}`);
+  console.log(`worker self peak RSS:     ${kb(report.workerSelfPeakRssKb)} (${report.workerSelfPeakCount ?? 0} report(s))`);  console.log(`worker self peak HWM:     ${kb(report.workerSelfPeakHwmKb)}`);
+  for (const p of (report.workerPhases ?? [])) {
+    const tag = p.gc ? `gc:${p.phase}` : p.phase;
+    const extra = p.collected !== null && p.collected !== undefined ? ` collected=${p.collected}` : '';
+    console.log(`worker phase:             ${tag}${extra} rss=${kb(p.rssKb)}`);
+  }
   for (const t of (report.workerTimings ?? []).filter((e) => e.kind === 'tokens' || e.kind === 'tokens-summary')) {
     console.log(`worker tokens:              ${JSON.stringify(t)}`);
   }

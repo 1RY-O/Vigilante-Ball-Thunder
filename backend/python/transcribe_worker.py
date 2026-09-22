@@ -119,6 +119,20 @@ def _read_self_rss_hwm_kb() -> tuple[int | None, int | None]:
     return rss, hwm
 
 
+# Phase-stamped RSS marks (stderr-only diagnostics).
+#
+# _mark() snapshots current VmRSS at pipeline boundaries so the process HWM
+# can be attributed to load / beat-grid / conditioning+generation / MIDI
+# bytes / music21 phases. Passive: production behavior is unchanged.
+def _mark(label: str) -> None:
+    rss, _ = _read_self_rss_hwm_kb()
+    print(f"[worker-phase] {label} rssKb={rss if rss is not None else 'n/a'}", file=sys.stderr)
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 class _PeakSampler:
     """Background max-RSS tracker; start()/stop() are safe to call anywhere."""
 
@@ -271,7 +285,7 @@ def resolve_instruments(raw: str | None) -> list[str] | None:
     return tokens
 
 
-def transcribe_midi(model, audio: str, instruments: list[str] | None, max_gen_len: int = 2000) -> tuple[bytes, list[str] | None]:
+def transcribe_midi(model, audio: str, instruments: list[str] | None, max_gen_len: int = 1000) -> tuple[bytes, list[str] | None]:
     """Real MuScriptor MIDI bytes plus the instrument names the model decoded.
 
     Instruments come from the model's OWN event stream
@@ -287,7 +301,17 @@ def transcribe_midi(model, audio: str, instruments: list[str] | None, max_gen_le
     except Exception:
         return model.transcribe_to_midi(audio, instruments=instruments), None
     try:
-        beat_grid = model.detect_beat_grid_for(audio)
+        # Optional MUSCRIPTOR_BEAT_GRID=off override (testing/low-memory
+        # mode): skip beat_this via the upstream-supported detect_tempo=False
+        # path. Default (unset) keeps beat-grid detection enabled — quality
+        # first. Skipped-grid MIDI lacks onset-delay snap, so such artifacts
+        # are discarded, never quality-compared.
+        beat_grid = None
+        if os.environ.get("MUSCRIPTOR_BEAT_GRID", "") != "off":
+            beat_grid = model.detect_beat_grid_for(audio)
+        else:
+            print("[worker-phase] beat-grid skipped (MUSCRIPTOR_BEAT_GRID=off)", file=sys.stderr)
+        _mark("post-beat-grid")
         # Cap override (see _apply_max_gen_len): upstream hardcodes 2000.
         # Default 1000 shrinks the per-chunk KV cache; 2000 restores upstream.
         _apply_max_gen_len(model, max_gen_len)
@@ -300,9 +324,11 @@ def transcribe_midi(model, audio: str, instruments: list[str] | None, max_gen_le
                 detected.add(event.instrument)
             events.append(event)
         _emit_token_summary(token_stats)
+        _mark("post-transcribe")
         midi_bytes = model.events_to_midi_bytes(iter(events), beat_grid=beat_grid)
         if not midi_bytes:
             raise RuntimeError("event stream produced no MIDI")
+        _mark("post-midi-bytes")
         return midi_bytes, sorted(detected) or None
     except Exception:
         traceback.print_exc(limit=2)
@@ -842,6 +868,7 @@ def main() -> int:
             f"loadSec={_load_sec:.2f}",
             file=sys.stderr,
         )
+        _mark("post-load")
 
         emit({"type": "progress", "stage": "transcribing"})
         midi_path = os.path.join(args.out, "transcription.mid")
@@ -865,6 +892,7 @@ def main() -> int:
         score = load_score(midi_path)
         metadata = extract_metadata(score)
         render_musicxml(score, xml_path, args.sheet_type)
+        _mark("post-music21")
 
         duration = None
         try:

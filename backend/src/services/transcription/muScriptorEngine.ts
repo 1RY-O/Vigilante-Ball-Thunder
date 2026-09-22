@@ -190,7 +190,7 @@ export class MuScriptorEngine implements TranscriptionEngine {
         // capture python-side HWM even after the child exits. Protocol,
         // artifacts and control flow below are unchanged.
         for (const line of chunk.split('\n')) {
-          if (line.includes('[worker-mem]') || line.includes('[worker-timing]') || line.includes('[worker] streaming load:') || line.includes('[worker-tokens')) console.error(`[muscriptor-worker] ${line.trim()}`);
+          if (line.includes('[worker-mem]') || line.includes('[worker-timing]') || line.includes('[worker] streaming load:') || line.includes('[worker-tokens') || line.includes('[worker-phase]')) console.error(`[muscriptor-worker] ${line.trim()}`);
         }
       });
       child.on('error', (err: NodeJS.ErrnoException) => {
@@ -318,7 +318,7 @@ export class MuScriptorEngine implements TranscriptionEngine {
         stderr += c;
         // PHASE 0/1A (measurement only): same peak/timing forwarding as transcribe().
         for (const line of c.split('\n')) {
-          if (line.includes('[worker-mem]') || line.includes('[worker-timing]') || line.includes('[worker] streaming load:') || line.includes('[worker-tokens')) console.error(`[muscriptor-worker] ${line.trim()}`);
+          if (line.includes('[worker-mem]') || line.includes('[worker-timing]') || line.includes('[worker] streaming load:') || line.includes('[worker-tokens') || line.includes('[worker-phase]')) console.error(`[muscriptor-worker] ${line.trim()}`);
         }
       });
       child.on('error', (err: NodeJS.ErrnoException) => {
