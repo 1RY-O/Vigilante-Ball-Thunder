@@ -121,6 +121,13 @@ export class MuScriptorEngine implements TranscriptionEngine {
       if (req.instrumentGroups.length > 0) {
         args.push('--instruments', req.instrumentGroups.join(','));
       }
+      // Generation-budget cap: forwarded only when the operator sets it.
+      // Unset means the worker default (1000) applies. Accepts the upstream
+      // value 2000 to restore exact upstream generation behavior.
+      const maxGenLen = (this.baseEnv['MUSCRIPTOR_MAX_GEN_LEN'] ?? '').trim();
+      if (maxGenLen !== '') {
+        args.push('--max-gen-len', maxGenLen);
+      }
       const child = spawn(this.pythonBin, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: this.baseEnv,
@@ -178,6 +185,13 @@ export class MuScriptorEngine implements TranscriptionEngine {
       child.stderr.setEncoding('utf8');
       child.stderr.on('data', (chunk: string) => {
         stderr += chunk;
+        // PHASE 0/1A (measurement only): forward the worker's self-reported
+        // peak/timing/audit lines to server stderr so the RAM harness can
+        // capture python-side HWM even after the child exits. Protocol,
+        // artifacts and control flow below are unchanged.
+        for (const line of chunk.split('\n')) {
+          if (line.includes('[worker-mem]') || line.includes('[worker-timing]') || line.includes('[worker] streaming load:') || line.includes('[worker-tokens')) console.error(`[muscriptor-worker] ${line.trim()}`);
+        }
       });
       child.on('error', (err: NodeJS.ErrnoException) => {
         clearTimeout(timer);
@@ -300,7 +314,13 @@ export class MuScriptorEngine implements TranscriptionEngine {
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', (c: string) => (stdout += c));
       child.stderr.setEncoding('utf8');
-      child.stderr.on('data', (c: string) => (stderr += c));
+      child.stderr.on('data', (c: string) => {
+        stderr += c;
+        // PHASE 0/1A (measurement only): same peak/timing forwarding as transcribe().
+        for (const line of c.split('\n')) {
+          if (line.includes('[worker-mem]') || line.includes('[worker-timing]') || line.includes('[worker] streaming load:') || line.includes('[worker-tokens')) console.error(`[muscriptor-worker] ${line.trim()}`);
+        }
+      });
       child.on('error', (err: NodeJS.ErrnoException) => {
         finish({
           ok: false,

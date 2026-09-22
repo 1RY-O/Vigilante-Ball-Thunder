@@ -75,6 +75,99 @@ def emit_error(code: str, message: str) -> None:
     emit({"type": "error", "code": code, "message": message})
 
 
+# PHASE 0 (measurement only): stdlib-only peak-memory sampler.
+#
+# Reads /proc/self/status (VmRSS = current, VmHWM = kernel peak) in a daemon
+# thread. Emits one stderr line at exit:
+#   [worker-mem] peakRssKb=<max polled RSS> peakHwmKb=<final VmHWM>
+# stderr is the diagnostics channel (never sent to clients); stdout protocol,
+# artifacts, dtypes and inference are untouched. No third-party deps.
+_PEAK_POLL_SEC = 0.1
+
+
+def _read_self_rss_hwm_kb() -> tuple[int | None, int | None]:
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except Exception:
+        text = ""
+    rss: int | None = None
+    hwm: int | None = None
+    for line in text.splitlines():
+        if line.startswith("VmRSS:"):
+            try:
+                rss = int(line.split()[1])
+            except Exception:
+                rss = None
+        elif line.startswith("VmHWM:"):
+            try:
+                hwm = int(line.split()[1])
+            except Exception:
+                hwm = None
+    if rss is None or hwm is None:
+        try:
+            import resource
+
+            # ru_maxrss is kilobytes on Linux.
+            hwm2 = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            if hwm is None:
+                hwm = hwm2
+            if rss is None:
+                rss = hwm2
+        except Exception:
+            pass
+    return rss, hwm
+
+
+class _PeakSampler:
+    """Background max-RSS tracker; start()/stop() are safe to call anywhere."""
+
+    def __init__(self, interval: float = _PEAK_POLL_SEC) -> None:
+        self._interval = interval
+        self._peak_rss: int | None = None
+        self._stop = False
+        self._thread = None
+
+    def start(self) -> None:
+        import threading
+
+        rss, _ = _read_self_rss_hwm_kb()
+        if rss is not None:
+            self._peak_rss = rss
+
+        def _loop() -> None:
+            import time
+
+            while not self._stop:
+                rss_now, _ = _read_self_rss_hwm_kb()
+                if rss_now is not None and (
+                    self._peak_rss is None or rss_now > self._peak_rss
+                ):
+                    self._peak_rss = rss_now
+                time.sleep(self._interval)
+
+        self._thread = threading.Thread(target=_loop, name="worker-mem-peak", daemon=True)
+        self._thread.start()
+
+    def stop_and_emit(self) -> None:
+        self._stop = True
+        try:
+            if self._thread is not None:
+                import time
+
+                # Let one final poll land; never block shutdown.
+                time.sleep(0.0)
+        except Exception:
+            pass
+        _, hwm = _read_self_rss_hwm_kb()
+        peak_rss = self._peak_rss if self._peak_rss is not None else hwm
+        print(
+            f"[worker-mem] peakRssKb={peak_rss if peak_rss is not None else 'n/a'} "
+            f"peakHwmKb={hwm if hwm is not None else 'n/a'}",
+            file=sys.stderr,
+        )
+
+
 def fail(code: str, message: str, exit_code: int) -> "SystemExit":
     emit_error(code, message)
     return SystemExit(exit_code)
@@ -178,7 +271,7 @@ def resolve_instruments(raw: str | None) -> list[str] | None:
     return tokens
 
 
-def transcribe_midi(model, audio: str, instruments: list[str] | None) -> tuple[bytes, list[str] | None]:
+def transcribe_midi(model, audio: str, instruments: list[str] | None, max_gen_len: int = 2000) -> tuple[bytes, list[str] | None]:
     """Real MuScriptor MIDI bytes plus the instrument names the model decoded.
 
     Instruments come from the model's OWN event stream
@@ -195,12 +288,18 @@ def transcribe_midi(model, audio: str, instruments: list[str] | None) -> tuple[b
         return model.transcribe_to_midi(audio, instruments=instruments), None
     try:
         beat_grid = model.detect_beat_grid_for(audio)
+        # Cap override (see _apply_max_gen_len): upstream hardcodes 2000.
+        # Default 1000 shrinks the per-chunk KV cache; 2000 restores upstream.
+        _apply_max_gen_len(model, max_gen_len)
+        # Per-chunk generation diagnostics (pass-through, stderr only).
+        token_stats = _install_token_counter(model, max_gen_len)
         detected: set[str] = set()
         events = []
         for event in model.transcribe(audio, instruments=instruments):
             if isinstance(event, NoteStartEvent):
                 detected.add(event.instrument)
             events.append(event)
+        _emit_token_summary(token_stats)
         midi_bytes = model.events_to_midi_bytes(iter(events), beat_grid=beat_grid)
         if not midi_bytes:
             raise RuntimeError("event stream produced no MIDI")
@@ -212,6 +311,111 @@ def transcribe_midi(model, audio: str, instruments: list[str] | None) -> tuple[b
             file=sys.stderr,
         )
         return model.transcribe_to_midi(audio, instruments=instruments), None
+
+
+# Generation-budget cap override.
+#
+# Upstream TranscriptionModel.transcribe() hardcodes max_gen_len = 2000 as a
+# local (no parameter, no env var), and third-party sources under .venv must
+# not be modified, so the cap is substituted at the _generate_token_stream
+# boundary (the single caller that forwards it to LMModel.generate, where
+# the KV cache of prepend_length + max_gen_len tokens is preallocated).
+# cap == 2000 is an exact passthrough of upstream behavior. Yields, dtypes,
+# chunking and decoding are untouched.
+def _apply_max_gen_len(transcription_model, cap: int) -> None:
+    if cap == 2000:
+        return
+    orig = transcription_model._generate_token_stream
+    import functools
+
+    @functools.wraps(orig)
+    def patched(*args, **kwargs):
+        if "max_gen_len" in kwargs:
+            kwargs["max_gen_len"] = cap
+        elif len(args) >= 4:
+            args = tuple([*args[:3], cap, *args[4:]])
+        else:  # pragma: no cover - defensive; all known callers pass it
+            kwargs["max_gen_len"] = cap
+        return orig(*args, **kwargs)
+
+    transcription_model._generate_token_stream = patched
+    print(f"[worker-timing] maxGenLen={cap} (upstream default 2000)", file=sys.stderr)
+
+
+# Per-chunk generation diagnostics (stderr only, inference untouched).
+#
+# Wraps LMModel.generate with a counting pass-through: each invocation is one
+# batch (batch_size=1 on the worker path, i.e. one 5s chunk). Counts yielded
+# timesteps, notes whether EOS appeared and whether the call used the full
+# max_gen_len budget without EOS (the silent-truncation condition, since
+# no_eos_is_ok=True only warns). A hitCap=True line means a chunk was
+# silently truncated and the cap must be raised.
+def _install_token_counter(transcription_model, cap: int = 2000) -> dict:
+    stats: dict = {"calls": []}
+    try:
+        lm = transcription_model._model
+        eos_id = transcription_model._tokenizer.eos_id
+    except Exception:
+        return stats
+    orig_generate = lm.generate
+    # cap is the experiment value from the caller closure (authoritative).
+    # generate() receives it as max_gen_len= kwarg, but kwargs.get() with a
+    # 2000 fallback would silently misreport a positional-passing caller, so
+    # the closure value is reported instead.
+
+    def counting_generate(*args, **kwargs):
+        import torch
+
+        call_idx = len(stats["calls"])
+        steps = 0
+        eos_seen = False
+        batch = None
+        for step in orig_generate(*args, **kwargs):
+            steps += 1
+            if batch is None:
+                try:
+                    batch = int(step.shape[0])
+                except Exception:
+                    batch = -1
+            try:
+                # Generator yields inference tensors; stay in inference mode.
+                with torch.inference_mode():
+                    if bool((step == eos_id).any().item()):
+                        eos_seen = True
+            except Exception:
+                pass
+            yield step
+        hit_cap = (not eos_seen) and (steps >= cap)
+        stats["calls"].append(
+            {"chunk": call_idx, "steps": steps, "eos": eos_seen,
+             "hitCap": hit_cap, "batch": batch, "maxGenLen": cap}
+        )
+        print(
+            f"[worker-tokens] chunk={call_idx} steps={steps} "
+            f"eos={str(eos_seen)} hitCap={str(hit_cap)} "
+            f"batch={batch} maxGenLen={cap}",
+            file=sys.stderr,
+        )
+
+    try:
+        lm.generate = counting_generate
+    except Exception:
+        pass
+    return stats
+
+
+def _emit_token_summary(stats: dict) -> None:
+    calls = stats.get("calls", [])
+    if not calls:
+        return
+    total = sum(c["steps"] for c in calls)
+    peak = max(c["steps"] for c in calls)
+    capped = sum(1 for c in calls if c["hitCap"])
+    print(
+        f"[worker-tokens-summary] chunks={len(calls)} maxSteps={peak} "
+        f"hitCap={capped} totalSteps={total}",
+        file=sys.stderr,
+    )
 
 
 def load_score(midi_path: str):
@@ -555,10 +759,36 @@ def main() -> int:
     parser.add_argument(
         "--dtype",
         default=os.environ.get("MUSCRIPTOR_DTYPE", "float32"),
-        choices=["float32", "float16", "bfloat16"],
+        # PHASE 1A verdict: float16 disabled. It ran stably on the 2s sine
+        # fixture (clean audit) but inference was ~2x slower than bfloat16
+        # (generate 3.80s vs 1.80s) for the same peak RSS, and fp16's narrow
+        # range risks overflow on real audio. bfloat16 is the candidate.
+        choices=["float32", "bfloat16"],
         help="Transformer weight/compute dtype (default: float32)",
     )
+    # PHASE 1A (comparison only): loader routing. "legacy" keeps the original
+    # TranscriptionModel.load_model() for float32 (the control). "streaming"
+    # routes float32 through the same per-tensor streaming loader used for
+    # float16/bfloat16 (config A). float16/bfloat16 always use streaming.
+    # No quantization, chunking, or generation changes.
+    parser.add_argument(
+        "--loader",
+        default=os.environ.get("MUSCRIPTOR_LOADER", "legacy"),
+        choices=["legacy", "streaming"],
+        help="Weight loader: legacy (control) or streaming (default: legacy)",
+    )
     parser.add_argument("--instruments", default=None, help="Comma-separated instrument restricts (optional)")
+    # Generation-budget cap (KV-cache control). Production default is 1000:
+    # measured -30..-45 MB (Small) and -106..-137 MB (Medium) worker HWM vs
+    # the upstream 2000, with byte-identical MIDI on dense real material and
+    # zero cap hits (densest chunk observed: 284/1000 tokens). Upstream
+    # hardcodes 2000; 2000 here restores the exact upstream behavior.
+    # Override with --max-gen-len or MUSCRIPTOR_MAX_GEN_LEN.
+    parser.add_argument(
+        "--max-gen-len",
+        default=os.environ.get("MUSCRIPTOR_MAX_GEN_LEN", "1000"),
+        help="Max tokens generated per 5 s chunk (default: 1000)",
+    )
     parser.add_argument(
         "--sheet-type",
         default="melody-chords",
@@ -568,6 +798,21 @@ def main() -> int:
     parser.add_argument("--self-check", action="store_true", help="Check deps + HF access only; do not transcribe")
     args = parser.parse_args()
 
+    # Validate the cap early with an honest argument error.
+    try:
+        max_gen_len = int(args.max_gen_len)
+    except (TypeError, ValueError):
+        max_gen_len = -1
+    if max_gen_len < 1:
+        raise fail(
+            "worker-args-invalid",
+            f"Invalid --max-gen-len value: {args.max_gen_len!r} (need a positive integer).",
+            4,
+        )
+
+    # PHASE 0 (measurement only): peak sampler around the unchanged pipeline.
+    sampler = _PeakSampler()
+    sampler.start()
     try:
         check_deps()
         check_hf(args.model)
@@ -581,16 +826,31 @@ def main() -> int:
         emit({"type": "progress", "stage": "loading_model"})
         from muscriptor import TranscriptionModel
 
-        if args.dtype == "float32":
-            model = TranscriptionModel.load_model(args.model)
-        else:
+        # PHASE 1A: loader selection + load/transcribe timing (stderr only).
+        import time as _time
+
+        use_streaming = args.loader == "streaming" or args.dtype != "float32"
+        loader_name = "streaming" if use_streaming else "legacy"
+        _load_t0 = _time.perf_counter()
+        if use_streaming:
             model = _load_model_streaming(args.model, args.dtype)
+        else:
+            model = TranscriptionModel.load_model(args.model)
+        _load_sec = _time.perf_counter() - _load_t0
+        print(
+            f"[worker-timing] loader={loader_name} dtype={args.dtype} "
+            f"loadSec={_load_sec:.2f}",
+            file=sys.stderr,
+        )
 
         emit({"type": "progress", "stage": "transcribing"})
         midi_path = os.path.join(args.out, "transcription.mid")
         xml_path = os.path.join(args.out, "transcription.musicxml")
         try:
-            midi_bytes, detected_instruments = transcribe_midi(model, args.audio, instrument_names)
+            _trx_t0 = _time.perf_counter()
+            midi_bytes, detected_instruments = transcribe_midi(model, args.audio, instrument_names, max_gen_len)
+            _trx_sec = _time.perf_counter() - _trx_t0
+            print(f"[worker-timing] transcribeSec={_trx_sec:.2f}", file=sys.stderr)
         except Exception as exc:
             tail = traceback.format_exc(limit=2)
             print(tail, file=sys.stderr)
@@ -633,6 +893,12 @@ def main() -> int:
         print(f"worker crashed: {exc!r}", file=sys.stderr)
         emit_error("transcription-failed", "Transcription failed unexpectedly.")
         return 3
+    finally:
+        # Diagnostics only; stdout protocol and artifacts above are untouched.
+        try:
+            sampler.stop_and_emit()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
