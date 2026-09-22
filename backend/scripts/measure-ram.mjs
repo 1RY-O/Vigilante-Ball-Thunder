@@ -56,6 +56,8 @@ const MODEL = argOf('--model', null);
 // Audio-lifetime probe (explicit, auditable; unset = production behavior):
 // --beat-grid off  -> MUSCRIPTOR_BEAT_GRID=off (skip beat_this)
 const BEAT_GRID = argOf('--beat-grid', null);
+// Thread-count sweep: --threads N -> VBT_THREADS=N (unset = torch default).
+const THREADS = argOf('--threads', null);
 
 // ---- /proc sampling ----
 function readStatusField(pid, field) {
@@ -246,6 +248,7 @@ async function main() {
   if (MAX_GEN_LEN !== null) env.MUSCRIPTOR_MAX_GEN_LEN = String(MAX_GEN_LEN);
   if (MODEL !== null) env.MUSCRIPTOR_MODEL = String(MODEL);
   if (BEAT_GRID !== null) env.MUSCRIPTOR_BEAT_GRID = String(BEAT_GRID);
+  if (THREADS !== null) env.VBT_THREADS = String(THREADS);
   const server = spawn('node', ['dist/index.js'], { cwd: BACKEND, env, stdio: ['ignore', 'pipe', 'pipe'] });
   const errTail = [];
   // PHASE 0: full stderr buffer for [worker-mem] parsing (tail kept for log).
@@ -379,6 +382,7 @@ async function main() {
     // Audio-lifetime profiling (additive): phase-stamped RSS trajectory.
     report.workerPhases = workerTimings.filter((e) => e.kind === 'phase');
     report.beatGridEnv = env.MUSCRIPTOR_BEAT_GRID ?? null;
+    report.threadsEnv = env.VBT_THREADS ?? null;
     report.loaderEnv = env.MUSCRIPTOR_LOADER ?? null;
     report.dtypeEnv = env.MUSCRIPTOR_DTYPE ?? null;
     // EXPERIMENT KV (additive): cap + fixture identity for the sweep table.

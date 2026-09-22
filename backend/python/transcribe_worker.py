@@ -339,8 +339,7 @@ def transcribe_midi(model, audio: str, instruments: list[str] | None, max_gen_le
         return model.transcribe_to_midi(audio, instruments=instruments), None
 
 
-# Generation-budget cap override.
-#
+# Generation-budget cap override.#
 # Upstream TranscriptionModel.transcribe() hardcodes max_gen_len = 2000 as a
 # local (no parameter, no env var), and third-party sources under .venv must
 # not be modified, so the cap is substituted at the _generate_token_stream
@@ -822,7 +821,34 @@ def main() -> int:
         help="Notation layout for the MusicXML artifact",
     )
     parser.add_argument("--self-check", action="store_true", help="Check deps + HF access only; do not transcribe")
+    # Thread-count control (allocator experiment, default: torch default).
+    # --threads N (or VBT_THREADS=N) sets OMP/MKL env vars before torch is
+    # imported and calls torch.set_num_threads(N) before model load. Unset
+    # means production behavior unchanged. Fewer threads may shrink
+    # per-thread buffers at the cost of slower transcribe.
+    parser.add_argument(
+        "--threads",
+        default=os.environ.get("VBT_THREADS", ""),
+        help="Torch intra-op thread count (default: unset = torch default)",
+    )
     args = parser.parse_args()
+
+    # Apply thread setting before any torch import (torch comes in lazily
+    # via check_deps/muscriptor). Explicit flag wins over ambient env.
+    threads: int | None = None
+    if str(args.threads).strip() != "":
+        try:
+            threads = int(args.threads)
+        except (TypeError, ValueError):
+            threads = -1
+        if threads is None or threads < 1:
+            raise fail(
+                "worker-args-invalid",
+                f"Invalid --threads value: {args.threads!r} (need a positive integer).",
+                4,
+            )
+        os.environ["OMP_NUM_THREADS"] = str(threads)
+        os.environ["MKL_NUM_THREADS"] = str(threads)
 
     # Validate the cap early with an honest argument error.
     try:
@@ -851,6 +877,17 @@ def main() -> int:
 
         emit({"type": "progress", "stage": "loading_model"})
         from muscriptor import TranscriptionModel
+
+        # Thread setting takes effect here (torch is imported by now).
+        if threads is not None:
+            import torch as _torch
+
+            _torch.set_num_threads(threads)
+            print(
+                f"[worker-timing] threads={threads} "
+                f"(torch reports {_torch.get_num_threads()})",
+                file=sys.stderr,
+            )
 
         # PHASE 1A: loader selection + load/transcribe timing (stderr only).
         import time as _time

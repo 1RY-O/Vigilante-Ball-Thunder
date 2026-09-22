@@ -29,17 +29,20 @@ const AUDIO_FILES = argOf('--audio-files', argOf('--audio-file', '/tmp/vbt-ram/d
   .split(',').map((s) => s.trim()).filter(Boolean);
 const PORT = argOf('--port', '4310');
 const MODEL = argOf('--model', 'small');
+// Thread sweep: comma-separated list; 'default' means no --threads flag.
+const THREADS_LIST = argOf('--threads-list', 'default').split(',').map((s) => s.trim()).filter(Boolean);
 const segTag = (p) => path.basename(p, path.extname(p)).replace(/[^A-Za-z0-9]+/g, '-');
 
 for (const audioFile of AUDIO_FILES) {
 for (const cap of CAPS) {
-  const tag = `kv-${MODEL}-${segTag(audioFile)}-${cap}`;
-  console.log(`\n===== sweep model=${MODEL} seg=${audioFile} cap=${cap} =====`);
-  const r = spawnSync(
-    'node',
-    ['scripts/measure-ram.mjs', '--engine', 'muscriptor',
+for (const th of THREADS_LIST) {
+  const tag = `kv-${MODEL}-${segTag(audioFile)}-${cap}-t${th}`;
+  console.log(`\n===== sweep model=${MODEL} seg=${audioFile} cap=${cap} threads=${th} =====`);
+  const hargs = ['scripts/measure-ram.mjs', '--engine', 'muscriptor',
      '--audio-file', audioFile, '--max-gen-len', cap, '--tag', tag,
-     '--port', PORT, '--model', MODEL],
+     '--port', PORT, '--model', MODEL];
+  if (th !== 'default') hargs.push('--threads', th);
+  const r = spawnSync('node', hargs,
     {
       cwd: path.resolve(HERE, '..'),
       stdio: 'inherit',
@@ -50,7 +53,8 @@ for (const cap of CAPS) {
       },
     },
   );
-  if (r.status !== 0) console.error(`[kv-sweep] seg=${audioFile} cap=${cap} harness exited ${r.status}`);
+  if (r.status !== 0) console.error(`[kv-sweep] seg=${audioFile} cap=${cap} threads=${th} harness exited ${r.status}`);
+}
 }
 }
 
@@ -58,30 +62,34 @@ console.log('\n===== SWEEP SUMMARY =====');
 const rows = [];
 for (const audioFile of AUDIO_FILES) {
 for (const cap of CAPS) {
-  const tag = `kv-${MODEL}-${segTag(audioFile)}-${cap}`;
+for (const th of THREADS_LIST) {
+  const tag = `kv-${MODEL}-${segTag(audioFile)}-${cap}-t${th}`;
   const p = `/tmp/vbt-ram/result-muscriptor-${tag}.json`;
   let d;
   try {
     d = JSON.parse(fs.readFileSync(p, 'utf8'));
   } catch {
-    console.log(`seg=${segTag(audioFile)} cap=${cap}: MISSING ${p}`);
+    console.log(`seg=${segTag(audioFile)} cap=${cap} threads=${th}: MISSING ${p}`);
     continue;
   }
   const toks = (d.workerTimings ?? []).filter((t) => t.kind === 'tokens');
   const sum = (d.workerTimings ?? []).find((t) => t.kind === 'tokens-summary');
   const load = (d.workerTimings ?? []).find((t) => t.kind === 'load');
   const trx = (d.workerTimings ?? []).find((t) => t.kind === 'transcribe');
+  const phases = (d.workerPhases ?? []).filter((e) => !e.gc).map((e) => `${e.phase}=${e.rssKb == null ? 'n/a' : Math.round(e.rssKb / 1024)}MB`).join(' ');
   rows.push({ cap, d, toks, sum, load, trx });
   const mb = (v) => (v == null ? 'n/a' : `${(v / 1024).toFixed(0)}MB`);
   console.log(
-    `seg=${segTag(audioFile)} cap=${cap} job=${d.jobStatus} pyHWM=${mb(d.workerSelfPeakHwmKb)} ` +
+    `seg=${segTag(audioFile)} cap=${cap} threads=${th} job=${d.jobStatus} pyHWM=${mb(d.workerSelfPeakHwmKb)} ` +
     `total=${mb(d.peakTotalKb)} ` +
     `load=${load?.loadSec ?? '?'}s trx=${trx?.transcribeSec ?? '?'}s wall=${(d.jobWallMs / 1000).toFixed(1)}s ` +
     `chunks=${sum?.chunks ?? '?'} maxSteps=${sum?.maxSteps ?? '?'} hitCap=${sum?.hitCap ?? '?'} ` +
     `midi=${d.midiArtifact ? `${d.midiArtifact.bytes}B sha=${d.midiArtifact.sha256}` : 'none'}`,
   );
+  if (phases) console.log(`    phases: ${phases}`);
   for (const t of toks) {
     console.log(`    chunk=${t.chunk} steps=${t.steps} eos=${t.eos} hitCap=${t.hitCap} maxGenLen=${t.maxGenLen}`);
   }
+}
 }
 }
