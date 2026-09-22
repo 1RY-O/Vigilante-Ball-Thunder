@@ -301,14 +301,15 @@ def transcribe_midi(model, audio: str, instruments: list[str] | None, max_gen_le
     except Exception:
         return model.transcribe_to_midi(audio, instruments=instruments), None
     try:
-        # Optional MUSCRIPTOR_BEAT_GRID=off override (testing/low-memory
-        # mode): skip beat_this via the upstream-supported detect_tempo=False
-        # path. Default (unset) keeps beat-grid detection enabled — quality
-        # first. Skipped-grid MIDI lacks onset-delay snap, so such artifacts
-        # are discarded, never quality-compared.
+        # Beat grid via the isolated helper subprocess (see
+        # _detect_beat_grid_subprocess): beat_this runs in a child that exits
+        # before generation, so its ~170 MB never joins our peak. Any helper
+        # failure warns and continues with None (placeholder tempo).
+        # MUSCRIPTOR_BEAT_GRID=off skips detection entirely (testing /
+        # low-memory mode; default keeps detection enabled, quality first).
         beat_grid = None
         if os.environ.get("MUSCRIPTOR_BEAT_GRID", "") != "off":
-            beat_grid = model.detect_beat_grid_for(audio)
+            beat_grid = _detect_beat_grid_subprocess(audio)
         else:
             print("[worker-phase] beat-grid skipped (MUSCRIPTOR_BEAT_GRID=off)", file=sys.stderr)
         _mark("post-beat-grid")
@@ -336,7 +337,109 @@ def transcribe_midi(model, audio: str, instruments: list[str] | None, max_gen_le
             "Warning: instrument detection unavailable; transcribing without it.",
             file=sys.stderr,
         )
+        # Fallback without in-process beat_this: same helper grid (or None),
+        # then the plain event stream serialized directly. Only if that also
+        # fails do we fall back to transcribe_to_midi (which may load the
+        # tracker in-process) rather than failing the job outright.
+        try:
+            fallback_grid = None
+            if os.environ.get("MUSCRIPTOR_BEAT_GRID", "") != "off":
+                fallback_grid = _detect_beat_grid_subprocess(audio)
+            from muscriptor import NoteEndEvent as _NoteEnd
+
+            _events = [e for e in model.transcribe(audio, instruments=instruments)
+                       if isinstance(e, (NoteStartEvent, _NoteEnd))]
+            _midi = model.events_to_midi_bytes(iter(_events), beat_grid=fallback_grid)
+            if _midi:
+                return _midi, None
+        except Exception:
+            traceback.print_exc(limit=1)
         return model.transcribe_to_midi(audio, instruments=instruments), None
+
+
+# Isolated beat-grid detection (beat_this subprocess).
+#
+# Spawns backend/python/beat_grid_worker.py with the same interpreter; the
+# child decodes the audio, runs detect_grid, prints one JSON line and exits,
+# freeing the tracker's ~170 MB before generation starts here. Returns a
+# .venv-native BeatGrid, or None (with a stderr warning) when the helper
+# exits non-zero, prints unparseable output, or crashes. Mirrors the old
+# best-effort contract: warn and fall back to the placeholder tempo.
+def _detect_beat_grid_subprocess(audio) -> object | None:
+    import subprocess
+
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "beat_grid_worker.py")
+    try:
+        proc = subprocess.run(
+            [sys.executable, helper, "--audio", str(audio)],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except Exception as exc:
+        print(
+            f"Warning: beat-grid helper could not start ({exc.__class__.__name__}); "
+            "continuing with placeholder tempo.",
+            file=sys.stderr,
+        )
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        # Try to report the helper's own reason (its JSON goes to stdout
+        # even on no-grid exits); fall back to the stderr tail.
+        reason = ""
+        try:
+            _payload = json.loads(proc.stdout.strip().splitlines()[-1])
+            reason = f"{_payload.get('code', 'unknown')}: {str(_payload.get('message', ''))[:150]}"
+        except Exception:
+            tail = (proc.stderr or "").strip().splitlines()[-1:] or ["no stderr output"]
+            reason = "; ".join(tail)[-200:]
+        print(
+            f"Warning: beat-grid helper exited {proc.returncode} ({reason}); "
+            "continuing with placeholder tempo.",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    except Exception:
+        print(
+            "Warning: beat-grid helper printed unparseable output; "
+            "continuing with placeholder tempo.",
+            file=sys.stderr,
+        )
+        return None
+    if not payload.get("ok"):
+        print(
+            f"Warning: no usable beat grid ({payload.get('code', 'unknown')}: "
+            f"{str(payload.get('message', ''))[:150]}); continuing with placeholder tempo.",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        import math as _math
+
+        import numpy as _np
+
+        from muscriptor.utils.beats import BeatGrid
+
+        bpm = float(payload["bpm"])
+        first_downbeat = float(payload["first_downbeat"])
+        bpb = payload.get("beats_per_bar")
+        beats = payload.get("beats") or []
+        if not _math.isfinite(bpm) or bpm <= 0 or not _math.isfinite(first_downbeat):
+            raise ValueError("non-finite grid values")
+        bpb = int(bpb) if bpb is not None else None
+        beats_arr = _np.asarray([float(b) for b in beats], dtype=float) if beats else None
+        return BeatGrid(
+            bpm=bpm, beats_per_bar=bpb, first_downbeat=first_downbeat, beats=beats_arr
+        )
+    except Exception as exc:
+        print(
+            f"Warning: beat-grid helper returned invalid data ({exc.__class__.__name__}); "
+            "continuing with placeholder tempo.",
+            file=sys.stderr,
+        )
+        return None
 
 
 # Generation-budget cap override.#
