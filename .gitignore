@@ -143,3 +143,5 @@ vite.config.ts.timestamp-*
 .vite/
 Arithmophobia.mp3
 benchmark-audio/
+__pycache__/
+*.pyc
