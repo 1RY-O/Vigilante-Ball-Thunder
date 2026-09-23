@@ -61,6 +61,19 @@ SHEET_TYPES = ("melody-chords", "piano-grand", "lead-sheet")
 # the highest pitch of a chord) at/above this lands on the treble staff.
 GRAND_STAFF_SPLIT_MIDI = 60
 
+# --- Notation cleanup (MIR engraving) ---
+# Strict, standard grid: 16th notes plus triplets. Anything finer (32nds and
+# below) snaps up to this grid instead of engraving as 64th/128th clutter.
+QUANTIZE_DIVISORS = (4, 3)
+# Below a 64th note (~a 128th): micro-duration artifacts / ghost notes from
+# the model that cause extreme micro-ties and beam clutter. Dropped, never
+# rendered. (At 120 BPM a 64th is ~31 ms, a 32nd ~62 ms, so this keeps real
+# 32nd-note material while removing sub-64th junk across tempi.)
+MIN_QUARTER_LENGTH = 0.06
+# music21's default score title when parsing MIDI; always replaced below.
+FRAGMENT_TITLE = "Music21 Fragment"
+DEFAULT_SCORE_TITLE = "Transcription"
+
 # music21's sentinel figure for a sonority it cannot name. Emitting it would be
 # a fake chord symbol, so such positions are left unlabelled instead.
 CHORD_SYMBOL_UNIDENTIFIED = "Chord Symbol Cannot Be Identified"
@@ -546,8 +559,12 @@ def _emit_token_summary(stats: dict) -> None:
     )
 
 
-def load_score(midi_path: str):
-    """Parse the decoded MIDI with music21 (real notes, or honest failure)."""
+def load_score(midi_path: str, title: str | None = None):
+    """Parse the decoded MIDI with music21 (real notes, or honest failure).
+
+    The parsed score is then quantized, de-cluttered and notated (real notes
+    only — see prepare_score); nothing is ever invented.
+    """
     from music21 import converter
 
     score = converter.parse(midi_path)
@@ -557,6 +574,137 @@ def load_score(midi_path: str):
             "No notes could be detected in this recording. Try a clearer recording with a prominent melody.",
             3,
         )
+    return prepare_score(score, title)
+
+
+def clean_score_title(score, title: str | None) -> None:
+    """Replace music21's default "Music21 Fragment" title.
+
+    Uses the caller-supplied track title (--title) or a clean default. Title
+    is metadata only; it never affects notes or whether a file validates.
+    """
+    clean = (title or "").strip() or DEFAULT_SCORE_TITLE
+    try:
+        from music21 import metadata as _metadata
+
+        if score.metadata is None:
+            score.metadata = _metadata.Metadata()
+        current = score.metadata.title or ""
+        if not current or current == FRAGMENT_TITLE:
+            score.metadata.title = clean
+    except Exception:
+        pass  # title is cosmetic; never fail a job over it
+
+
+def carry_title(source, dest) -> None:
+    """Copy the cleaned score title onto a derived layout.
+
+    build_grand_staff()/build_lead_sheet() construct brand-new Score/Part
+    objects, which would otherwise fall back to music21's default
+    "Music21 Fragment" title on write. Cosmetic only; never raises.
+    """
+    try:
+        from music21 import metadata as _metadata
+
+        title = ""
+        try:
+            if source is not None and source.metadata is not None:
+                title = source.metadata.title or ""
+        except Exception:
+            title = ""
+        if not title or title == FRAGMENT_TITLE:
+            title = DEFAULT_SCORE_TITLE
+        if dest.metadata is None:
+            dest.metadata = _metadata.Metadata()
+        dest.metadata.title = title
+    except Exception:
+        pass
+
+
+def remove_ghost_notes(container) -> None:
+    """Drop micro-duration artifacts (< MIN_QUARTER_LENGTH).
+
+    These sub-64th blips from the model engrave as extreme micro-ties and
+    beam clutter. Real notes are untouched; an empty container stays empty
+    (no placeholder is ever added).
+    """
+    try:
+        victims = []
+        for element in list(container.recurse().notes):
+            try:
+                quarter_length = float(element.quarterLength)
+            except Exception:
+                continue
+            if quarter_length < MIN_QUARTER_LENGTH:
+                victims.append(element)
+        for element in victims:
+            site = element.activeSite
+            if site is None:
+                continue
+            try:
+                site.remove(element)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def quantize_part(part) -> None:
+    """Snap offsets and durations to the strict 16th-plus-triplet grid.
+
+    Best-effort: if music21 cannot quantize a pathological part, the raw
+    timing survives and notation still proceeds below.
+    """
+    try:
+        part.quantize(
+            quarterLengthDivisors=QUANTIZE_DIVISORS,
+            processOffsets=True,
+            processDurations=True,
+            inPlace=True,
+        )
+    except Exception:
+        pass
+
+
+def notate_part(part) -> None:
+    """Full notation pass (measures, ties, beams, rests) — never crashes.
+
+    makeNotation() builds voices/measures/ties/beams/accidentals; the
+    follow-up makeRests(fillGaps=True) pads intra-measure gaps so rests align
+    logically. Each step is best-effort so engraving can never fail the job;
+    render_musicxml() still maps a genuinely un-layoutable score to
+    sheet-type-unsupported.
+    """
+    try:
+        part.makeNotation(inPlace=True)
+    except Exception:
+        pass
+    try:
+        part.makeRests(fillGaps=True, inPlace=True)
+    except Exception:
+        pass
+
+
+def prepare_score(score, title: str | None = None):
+    """Quantize, de-clutter, title and notate the decoded score.
+
+    Operates per part (or on the flat score when the MIDI parsed with no
+    parts). Ghost filtering runs both before quantization (so sub-grid junk
+    never quantizes to zero duration) and after (to catch leftovers the grid
+    shrank). Safe on edge cases: empty parts, a single part, or an already
+    measured score all pass through without raising.
+    """
+    clean_score_title(score, title)
+    try:
+        parts = list(score.parts) if score.parts else [score]
+    except Exception:
+        parts = [score]
+    for part in parts:
+        remove_ghost_notes(part)
+        quantize_part(part)
+        remove_ghost_notes(part)
+    for part in parts:
+        notate_part(part)
     return score
 
 
@@ -632,15 +780,20 @@ def build_grand_staff(score):
     treble.insert(0, clef.TrebleClef())
     bass.insert(0, clef.BassClef())
     for staff_part in (treble, bass):
-        # Measures are required for music21 to join the two PartStaffs into one
-        # MusicXML part with <staves>2</staves>; an empty staff gets its rests.
-        staff_part.makeMeasures(inPlace=True)
-        staff_part.makeAccidentals(inPlace=True)
+        # Full notation pass (measures/ties/beams/rests) so each staff reads
+        # cleanly; an empty staff gets its rests via fillGaps. Best-effort so
+        # a pathological staff can never crash the job.
+        notate_part(staff_part)
+        try:
+            staff_part.makeAccidentals(inPlace=True)
+        except Exception:
+            pass
 
     out = stream.Score()
     out.insert(0, treble)
     out.insert(0, bass)
     out.insert(0, layout.StaffGroup([treble, bass], name="Piano", symbol="brace"))
+    carry_title(score, out)
     return out
 
 
@@ -673,8 +826,12 @@ def build_lead_sheet(score):
             continue
         part.insert(stacked.getOffsetInHierarchy(verticals), harmony.ChordSymbol(figure))
 
-    part.makeMeasures(inPlace=True)
-    part.makeAccidentals(inPlace=True)
+    notate_part(part)
+    try:
+        part.makeAccidentals(inPlace=True)
+    except Exception:
+        pass
+    carry_title(score, part)
     return part
 
 
@@ -923,6 +1080,12 @@ def main() -> int:
         choices=list(SHEET_TYPES),
         help="Notation layout for the MusicXML artifact",
     )
+    parser.add_argument(
+        "--title",
+        default=None,
+        help="Score title for the MusicXML metadata (default: clean 'Transcription'). "
+        "Replaces music21's 'Music21 Fragment' placeholder; cosmetic only.",
+    )
     parser.add_argument("--self-check", action="store_true", help="Check deps + HF access only; do not transcribe")
     # Thread-count control (allocator experiment, default: torch default).
     # --threads N (or VBT_THREADS=N) sets OMP/MKL env vars before torch is
@@ -1029,7 +1192,7 @@ def main() -> int:
             fh.write(midi_bytes)
 
         emit({"type": "progress", "stage": "converting"})
-        score = load_score(midi_path)
+        score = load_score(midi_path, args.title)
         metadata = extract_metadata(score)
         render_musicxml(score, xml_path, args.sheet_type)
         _mark("post-music21")
