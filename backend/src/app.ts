@@ -11,6 +11,11 @@ import type { AppContext } from './appContext.js';
 export function createApp(ctx: AppContext): express.Express {
   const app = express();
   app.disable('x-powered-by');
+  // Render (and any reverse proxy) terminates TLS and appends
+  // X-Forwarded-For. Without this, express-rate-limit v7 refuses to run
+  // (ERR_ERL_UNEXPECTED_X_FORWARDED_FOR) or attributes every client to
+  // 127.0.0.1. Must precede any rate-limit middleware.
+  app.set('trust proxy', 1);
   // JSON only for small API bodies; uploads use multipart via multer.
   app.use(express.json({ limit: '64kb' }));
 

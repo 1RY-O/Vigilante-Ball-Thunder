@@ -55,8 +55,22 @@ export class RemoteMuScriptorEngine implements TranscriptionEngine {
     private readonly timeoutMs: number = 30 * 60 * 1000,
   ) {}
 
+  /** Outbound identity: *.trycloudflare.com bot-mitigation blocks bare fetches. */
+  private static readonly HEADERS: Record<string, string> = {
+    'User-Agent': 'VigilanteBallThunder-Coordinator/1.0',
+    Accept: 'application/json',
+  };
+
+  /**
+   * Trimmed base URL with accidental trailing slashes stripped, so endpoint
+   * paths never evaluate to `//health` or `//transcribe`.
+   */
+  private base(): string {
+    return this.remoteUrl.trim().replace(/\/+$/, '');
+  }
+
   async available(_forceRefresh = false): Promise<EngineAvailability> {
-    const base = this.remoteUrl.trim();
+    const base = this.base();
     if (!base) {
       return {
         ok: false,
@@ -66,7 +80,10 @@ export class RemoteMuScriptorEngine implements TranscriptionEngine {
       };
     }
     try {
-      const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(10_000) });
+      const res = await fetch(`${base}/health`, {
+        headers: RemoteMuScriptorEngine.HEADERS,
+        signal: AbortSignal.timeout(10_000),
+      });
       if (!res.ok) {
         return {
           ok: false,
@@ -85,7 +102,7 @@ export class RemoteMuScriptorEngine implements TranscriptionEngine {
   }
 
   async transcribe(req: TranscribeRequest, onProgress: ProgressReporter): Promise<EngineResult> {
-    const base = this.remoteUrl.trim();
+    const base = this.base();
     if (!base) {
       throw new EngineUnavailableError(
         'TRANSCRIPTION_ENGINE=remote is set but MUSCRIPTOR_REMOTE_URL is empty.',
@@ -113,7 +130,13 @@ export class RemoteMuScriptorEngine implements TranscriptionEngine {
     const signal = req.signal.aborted ? req.signal : AbortSignal.any([req.signal, timeout]);
     let res: Response;
     try {
-      res = await fetch(`${base}/transcribe`, { method: 'POST', body: formData, signal });
+      // NOTE: no explicit Content-Type — fetch sets the multipart boundary.
+      res = await fetch(`${base}/transcribe`, {
+        method: 'POST',
+        headers: RemoteMuScriptorEngine.HEADERS,
+        body: formData,
+        signal,
+      });
     } catch (err: unknown) {
       if (req.signal.aborted) throw new CancelledError();
       throw new EngineUnavailableError(
