@@ -28,12 +28,16 @@ Instrument hints:
   here as worker-args-invalid rather than silently changing the constraint.
 
 Sheet types:
-  melody-chords  the decoded part exactly as the model produced it
+  melody-chords  the decoded part exactly as the model produced it, EXCEPT
+                 piano material (detected or requested instrument is a piano),
+                 which is always laid out as piano-grand below — a single
+                 treble staff cannot legibly render piano music
   piano-grand    the same notes laid out on a two-staff piano part (treble +
-                 bass, split at middle C), with real <staves>2</staves>
+                 bass, split at middle C with spanning chords divided
+                 pitch-by-pitch), with real <staves>2</staves>
   lead-sheet     highest voice as the melody line plus chord symbols read from
                  the decoded vertical sonorities
-  The last two are music21 post-processing of the REAL decoded MIDI: no note,
+  These layouts are music21 post-processing of the REAL decoded MIDI: no note,
   chord or timing is ever invented. When music21 cannot name a sonority, that
   position simply carries no chord symbol; when a layout genuinely cannot be
   built the worker fails with sheet-type-unsupported (never a standby layout).
@@ -667,14 +671,20 @@ def quantize_part(part) -> None:
 
 
 def notate_part(part) -> None:
-    """Full notation pass (measures, ties, beams, rests) — never crashes.
+    """Full notation pass (voices, measures, ties, beams, rests) — never crashes.
 
-    makeNotation() builds voices/measures/ties/beams/accidentals; the
-    follow-up makeRests(fillGaps=True) pads intra-measure gaps so rests align
+    makeVoices() separates overlapping durations into voices first so stems
+    cannot collide into solid blocks; makeNotation() then builds
+    voices/measures/ties/beams/accidentals; the follow-up
+    makeRests(fillGaps=True) pads intra-measure gaps so rests align
     logically. Each step is best-effort so engraving can never fail the job;
     render_musicxml() still maps a genuinely un-layoutable score to
     sheet-type-unsupported.
     """
+    try:
+        part.makeVoices(inPlace=True)
+    except Exception:
+        pass
     try:
         part.makeNotation(inPlace=True)
     except Exception:
@@ -759,6 +769,141 @@ def identifiable_chord_figure(source_chord) -> str | None:
     return figure
 
 
+def is_piano_instrument(names) -> bool:
+    """True when any instrument name denotes a piano.
+
+    Matches the MT3_FULL_PLUS group vocabulary ('acoustic_piano',
+    'electric_piano') and plain 'piano'. Deliberately substring-based so both
+    detected (model-reported) and requested (--instruments) names are covered;
+    'organ' is NOT matched — it is not a piano.
+    """
+    try:
+        return any("piano" in str(n).lower() for n in (names or []))
+    except Exception:
+        return False
+
+
+def wants_grand_staff(sheet_type: str, instruments) -> bool:
+    """Grand-staff routing: explicit request OR piano material on the default.
+
+    The web client defaults to `--sheet-type melody-chords`, which jams piano
+    audio onto a single treble staff (ledger-line collisions). Piano music is
+    therefore ALWAYS laid out as a two-staff Grand Staff when the default
+    'melody-chords' layout was requested — a single treble staff cannot
+    legibly render it. An explicit 'lead-sheet' request is always honored
+    (it is a distinct arrangement choice, not a piano rendering), and
+    non-piano material keeps the exact layout it asked for.
+    """
+    try:
+        if sheet_type == "piano-grand":
+            return True
+        if sheet_type == "lead-sheet":
+            return False
+        return is_piano_instrument(instruments)
+    except Exception:
+        return sheet_type == "piano-grand"
+
+
+def split_for_grand_staff(element):
+    """Split one Note/Chord into (high, low) gems for the two staves.
+
+    Returns fresh objects (same pitches, same quarterLength — nothing added,
+    removed or transposed); either side is None when it owns no pitches.
+    Chords SPANNING middle C are divided pitch-by-pitch so neither staff gets
+    a giant ledger-line ladder. A single surviving pitch becomes a Note (cleaner
+    engraving than a one-pitch Chord).
+    """
+    import copy
+    from music21 import chord as _chord_mod
+    from music21 import note as _note_mod
+
+    try:
+        quarter_length = element.quarterLength
+    except Exception:
+        return None, None
+    try:
+        pitches = list(element.pitches)
+    except Exception:
+        return None, None
+    if not pitches:
+        return None, None
+
+    def _build(side_pitches):
+        if not side_pitches:
+            return None
+        try:
+            got = [copy.deepcopy(p) for p in side_pitches]
+            obj = (
+                _note_mod.Note(got[0], quarterLength=quarter_length)
+                if len(got) == 1
+                else _chord_mod.Chord(got, quarterLength=quarter_length)
+            )
+            return obj
+        except Exception:
+            return None
+
+    if element.isChord:
+        high = [p for p in pitches if p.midi >= GRAND_STAFF_SPLIT_MIDI]
+        low = [p for p in pitches if p.midi < GRAND_STAFF_SPLIT_MIDI]
+        return _build(high), _build(low)
+    try:
+        top = max(pitches, key=lambda p: p.midi)
+    except Exception:
+        return None, None
+    if top.midi >= GRAND_STAFF_SPLIT_MIDI:
+        return _build(pitches), None
+    return None, _build(pitches)
+
+
+def sync_grand_staff_rests(treble, bass) -> None:
+    """Rest-fill both staves so barlines stay vertically synchronized.
+
+    Every measure where one hand is resting gets clean rests via
+    makeRests(fillGaps=True). Edge case: an all-high (or all-low) recording
+    leaves one staff note-less — it is filled with rests spanning the
+    sibling's full range and notated, so the system still has two aligned
+    staves instead of a missing half. Rests are standard notation filler, not
+    fabricated notes. Never raises.
+    """
+    from music21 import note as _note_mod
+    from music21 import stream as _stream_mod
+
+    # Empty-staff edge first, so the per-measure pass below has measures.
+    try:
+        staffs = (treble, bass)
+        has_notes = [bool(list(s.recurse().notes)) for s in staffs]
+        if has_notes[0] != has_notes[1]:
+            full = staffs[0] if has_notes[0] else staffs[1]
+            empty = staffs[1] if has_notes[0] else staffs[0]
+            try:
+                span = float(full.highestTime)
+            except Exception:
+                span = 0.0
+            if span > 0:
+                try:
+                    empty.insert(0, _note_mod.Rest(quarterLength=span))
+                except Exception:
+                    pass
+                else:
+                    notate_part(empty)
+                    try:
+                        empty.makeAccidentals(inPlace=True)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    for staff_part in (treble, bass):
+        try:
+            measures = list(staff_part.getElementsByClass(_stream_mod.Measure))
+        except Exception:
+            continue
+        for m in measures:
+            try:
+                m.makeRests(fillGaps=True, inPlace=True)
+            except Exception:
+                pass
+
+
 def build_grand_staff(score):
     """Two-staff piano layout of the SAME decoded notes (treble + bass)."""
     from music21 import clef, instrument, layout, stream
@@ -771,23 +916,40 @@ def build_grand_staff(score):
     bass.insert(0, instrument.Piano())
 
     for element in score.recurse().notes:
-        pitches = [p.midi for p in element.pitches]
-        if not pitches:
+        if not element.pitches:
             continue
-        target = treble if max(pitches) >= GRAND_STAFF_SPLIT_MIDI else bass
-        target.insert(element.getOffsetInHierarchy(score), element)
+        try:
+            offset = element.getOffsetInHierarchy(score)
+        except Exception:
+            continue
+        high, low = split_for_grand_staff(element)
+        if high is not None:
+            try:
+                treble.insert(offset, high)
+            except Exception:
+                pass
+        if low is not None:
+            try:
+                bass.insert(offset, low)
+            except Exception:
+                pass
 
     treble.insert(0, clef.TrebleClef())
     bass.insert(0, clef.BassClef())
     for staff_part in (treble, bass):
-        # Full notation pass (measures/ties/beams/rests) so each staff reads
-        # cleanly; an empty staff gets its rests via fillGaps. Best-effort so
-        # a pathological staff can never crash the job.
+        # Full notation pass (voices/measures/ties/beams/rests) so each staff
+        # reads cleanly. Best-effort so a pathological staff can never crash
+        # the job; all-high or all-low recordings simply leave one staff to
+        # be rest-filled below.
         notate_part(staff_part)
         try:
             staff_part.makeAccidentals(inPlace=True)
         except Exception:
             pass
+    # Keep the two staves vertically synchronized: any measure where one hand
+    # is resting gets clean rests (an empty staff gets full-measure rests
+    # spanning the sibling's range, so barlines line up across the system).
+    sync_grand_staff_rests(treble, bass)
 
     out = stream.Score()
     out.insert(0, treble)
@@ -835,10 +997,22 @@ def build_lead_sheet(score):
     return part
 
 
-def render_musicxml(score, xml_path: str, sheet_type: str) -> None:
-    """Write the requested layout. Never substitutes a different layout."""
+def render_musicxml(score, xml_path: str, sheet_type: str, instruments=None) -> None:
+    """Write the requested layout (with the piano grand-staff guarantee).
+
+    - sheet_type 'piano-grand' → two-staff Grand Staff.
+    - sheet_type 'lead-sheet'  → melody + chord symbols (always honored, even
+      for piano: it is an explicit arrangement choice).
+    - sheet_type 'melody-chords' → the decoded part as-is, EXCEPT piano
+      material (detected or requested instrument names a piano): piano is
+      ALWAYS laid out as a two-staff Grand Staff even when the client asked
+      for the 'melody-chords' default, because a single treble staff cannot
+      legibly render piano music (ledger-line collisions). This routing is
+      stated here and in wants_grand_staff() — never a silent substitution,
+      and non-piano material always keeps the exact layout it asked for.
+    """
     try:
-        if sheet_type == "piano-grand":
+        if wants_grand_staff(sheet_type, instruments):
             build_grand_staff(score).write("musicxml", fp=xml_path)
         elif sheet_type == "lead-sheet":
             build_lead_sheet(score).write("musicxml", fp=xml_path)
@@ -1194,7 +1368,15 @@ def main() -> int:
         emit({"type": "progress", "stage": "converting"})
         score = load_score(midi_path, args.title)
         metadata = extract_metadata(score)
-        render_musicxml(score, xml_path, args.sheet_type)
+        # Piano auto-upgrade needs BOTH the detected instruments (what the
+        # model actually decoded) and the requested ones (--instruments hint):
+        # either naming a piano routes to the Grand Staff.
+        render_musicxml(
+            score,
+            xml_path,
+            args.sheet_type,
+            list(detected_instruments or []) + list(instrument_names or []),
+        )
         _mark("post-music21")
 
         duration = None
