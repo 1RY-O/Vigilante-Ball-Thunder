@@ -12,7 +12,7 @@ export const BACKEND_DIR = path.resolve(HERE, '..');
 // Existing process env wins. HF_TOKEN is never logged by this codebase.
 loadDotenv({ path: path.join(BACKEND_DIR, '.env') });
 
-export type EngineKind = 'muscriptor' | 'stub';
+export type EngineKind = 'muscriptor' | 'stub' | 'remote';
 
 export interface Config {
   nodeEnv: string;
@@ -27,6 +27,12 @@ export interface Config {
   pythonBin: string;
   workerPath: string;
   engine: EngineKind;
+  /**
+   * Base URL of the remote compute worker (e.g. http://worker:8000).
+   * Only used with TRANSCRIPTION_ENGINE=remote. Empty means unconfigured:
+   * the remote engine then reports honestly instead of dialing nowhere.
+   */
+  remoteWorkerUrl: string;
   rateLimitWindowMs: number;
   rateLimitMax: number;
   workerTimeoutMs: number;
@@ -112,7 +118,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     model: isSupportedModel(model) ? model : 'small',
     pythonBin: env.PYTHON_BIN ?? defaultPythonBin(),
     workerPath: env.WORKER_PATH ?? path.join(BACKEND_DIR, 'python', 'transcribe_worker.py'),
-    engine: env.TRANSCRIPTION_ENGINE === 'stub' ? 'stub' : 'muscriptor',
+    engine:
+      env.TRANSCRIPTION_ENGINE === 'stub'
+        ? 'stub'
+        : env.TRANSCRIPTION_ENGINE === 'remote'
+          ? 'remote'
+          : 'muscriptor',
+    remoteWorkerUrl: env.MUSCRIPTOR_REMOTE_URL?.trim() ?? '',
     rateLimitWindowMs: int(env.RATE_LIMIT_WINDOW_MS, 60 * 1000),
     rateLimitMax: int(env.RATE_LIMIT_MAX, 10),
     workerTimeoutMs: int(env.WORKER_TIMEOUT_MS, 30 * 60 * 1000),

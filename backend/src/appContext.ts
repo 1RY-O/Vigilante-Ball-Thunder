@@ -8,6 +8,7 @@ import { JobManager } from './services/transcription/jobManager.js';
 import { AvailabilityMonitor } from './services/transcription/availabilityMonitor.js';
 import type { TranscriptionEngine } from './services/transcription/engine.js';
 import { MuScriptorEngine } from './services/transcription/muScriptorEngine.js';
+import { RemoteMuScriptorEngine } from './services/transcription/remoteEngine.js';
 import { StubEngine } from './services/transcription/stubEngine.js';
 import { PlaybackService } from './services/playback/playbackService.js';
 import { buildRateLimiter } from './middleware/rateLimit.js';
@@ -48,7 +49,9 @@ export async function buildContext(overrides: ContextOverrides = {}): Promise<Ap
     overrides.engine ??
     (config.engine === 'stub'
       ? new StubEngine() // MOCK — labeled everywhere; see stubEngine.ts
-      : new MuScriptorEngine({
+      : config.engine === 'remote'
+        ? new RemoteMuScriptorEngine(config.remoteWorkerUrl, config.workerTimeoutMs)
+        : new MuScriptorEngine({
           pythonBin: config.pythonBin,
           workerPath: config.workerPath,
           model: config.model,
