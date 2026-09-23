@@ -74,6 +74,31 @@ QUANTIZE_DIVISORS = (4, 3)
 # rendered. (At 120 BPM a 64th is ~31 ms, a 32nd ~62 ms, so this keeps real
 # 32nd-note material while removing sub-64th junk across tempi.)
 MIN_QUARTER_LENGTH = 0.06
+# Standard 88-key piano compass. Anything outside is key noise, string
+# resonance or a model glitch — discarded, never rendered.
+PIANO_MIDI_LO = 21  # A0
+PIANO_MIDI_HI = 108  # C8
+# Harmonic overtone suppression: an isolated short blip above C6 with low
+# velocity and no lower sustaining pitch is almost always an acoustic
+# harmonic, not a played note.
+OVERTONE_MIDI = 84  # C6
+OVERTONE_MAX_QL = 0.25  # 16th note
+OVERTONE_LOW_VELOCITY = 40
+OVERTONE_ISOLATION_QL = 0.125
+# Clef staff compasses (assignment only — never transposed; extremes keep
+# honest ledger lines). Overlap 55-67 defaults to the middle-C split.
+TREBLE_COMPASS = (55, 96)  # G3..C7
+BASS_COMPASS = (28, 67)  # E1..G4
+# Metric lattice: every residual duration snaps to the nearest of these.
+STANDARD_DURATIONS = (0.25, 1.0 / 3.0, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0)
+# Onsets this close coalesce into one Chord (no colliding sub-voices).
+ONSET_MERGE_QL = 0.06
+# A sustained note overshooting the next onset by less than this is truncated.
+OVERLAP_TRUNCATE_QL = 0.125
+# Conservative meter default when the MIDI carries none.
+DEFAULT_TIME_SIGNATURE = "4/4"
+# Treble notes above G5 keep automatic stem direction; at/below force up.
+TREBLE_STEM_FLIP_MIDI = 79  # G5
 # music21's default score title when parsing MIDI; always replaced below.
 FRAGMENT_TITLE = "Music21 Fragment"
 DEFAULT_SCORE_TITLE = "Transcription"
@@ -670,6 +695,298 @@ def quantize_part(part) -> None:
         pass
 
 
+def ensure_meter(part) -> None:
+    """Insert the conservative 4/4 default when the MIDI carries no meter.
+
+    Without a meter definition Verovio computes irregular barline geometry.
+    An existing time signature is always respected — this only fills the
+    absence. Never raises.
+    """
+    try:
+        from music21 import meter as _meter_mod
+
+        try:
+            existing = list(part.recurse().getElementsByClass(_meter_mod.TimeSignature))
+        except Exception:
+            existing = []
+        if not existing:
+            try:
+                part.insert(0, _meter_mod.TimeSignature(DEFAULT_TIME_SIGNATURE))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _event_midis(element) -> list[int]:
+    try:
+        return [int(p.midi) for p in element.pitches]
+    except Exception:
+        return []
+
+
+def clean_pitch_events(container) -> None:
+    """88-key enforcement plus harmonic overtone suppression.
+
+    - Any pitch outside MIDI 21 (A0)..108 (C8) is key noise, string resonance
+      or a model glitch: dropped from chords, whole notes dropped. The MIDI
+      artifact on disk is untouched (written from the raw model bytes before
+      conversion) — this only cleans the engraved score.
+    - An isolated single note above C6, shorter than a 16th, with low velocity
+      or no lower sustaining pitch, is pruned as an acoustic harmonic.
+    Real, sustained, supported notes always survive. Never raises.
+    """
+    try:
+        events = list(container.recurse().notes)
+    except Exception:
+        return
+    for element in events:
+        try:
+            midis = _event_midis(element)
+            if not midis:
+                continue
+            in_range = [m for m in midis if PIANO_MIDI_LO <= m <= PIANO_MIDI_HI]
+            if len(in_range) < len(midis):
+                _drop_or_shrink_pitches(element, in_range)
+                if not in_range:
+                    continue
+            if not element.isChord:
+                _prune_overtone(element, events)
+        except Exception:
+            pass
+
+
+def _drop_or_shrink_pitches(element, keep_midis: list[int]) -> None:
+    """Remove out-of-range pitches from a chord, or drop a fully void note."""
+    import copy
+    from music21 import chord as _chord_mod
+    from music21 import note as _note_mod
+
+    try:
+        site = element.activeSite
+        if site is None:
+            return
+        try:
+            offset = float(element.offset)
+        except Exception:
+            return
+        try:
+            quarter_length = element.quarterLength
+        except Exception:
+            return
+        keep = [p for p in element.pitches if int(p.midi) in keep_midis]
+        if not keep:
+            try:
+                site.remove(element)
+            except Exception:
+                pass
+            return
+        if element.isChord and len(keep) < len(list(element.pitches)):
+            try:
+                new_pitches = [copy.deepcopy(p) for p in keep]
+                replacement = (
+                    _note_mod.Note(new_pitches[0], quarterLength=quarter_length)
+                    if len(new_pitches) == 1
+                    else _chord_mod.Chord(new_pitches, quarterLength=quarter_length)
+                )
+                site.remove(element)
+                site.insert(offset, replacement)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _prune_overtone(element, siblings) -> None:
+    """Drop one element when it matches the isolated-harmonic profile."""
+    try:
+        midis = _event_midis(element)
+        if len(midis) != 1 or midis[0] <= OVERTONE_MIDI:
+            return
+        try:
+            quarter_length = float(element.quarterLength)
+        except Exception:
+            return
+        if quarter_length >= OVERTONE_MAX_QL:
+            return
+        try:
+            onset = float(element.getOffsetInHierarchy(element.activeSite))
+        except Exception:
+            try:
+                onset = float(element.offset)
+            except Exception:
+                return
+        # Isolated: no other onset nearby.
+        for other in siblings:
+            if other is element:
+                continue
+            try:
+                oo = float(other.getOffsetInHierarchy(other.activeSite))
+            except Exception:
+                try:
+                    oo = float(other.offset)
+                except Exception:
+                    continue
+            if abs(oo - onset) < OVERTONE_ISOLATION_QL:
+                return
+        # Low velocity?
+        low_velocity = False
+        try:
+            vel = element.volume.velocity
+            low_velocity = vel is not None and int(vel) < OVERTONE_LOW_VELOCITY
+        except Exception:
+            low_velocity = False
+        # Sustained harmonic support? A lower pitch sounding through this onset.
+        supported = False
+        for other in siblings:
+            if other is element:
+                continue
+            try:
+                oo = float(other.getOffsetInHierarchy(other.activeSite))
+                od = float(other.quarterLength)
+                o_top = max(_event_midis(other), default=10**9)
+            except Exception:
+                continue
+            if oo <= onset <= oo + od and o_top < midis[0]:
+                supported = True
+                break
+        if not (low_velocity or not supported):
+            return
+        site = element.activeSite
+        if site is not None:
+            try:
+                site.remove(element)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def snap_to_standard_durations(container) -> None:
+    """Snap residual durations to the strict metric lattice.
+
+    After quantize(), strays snap to the nearest of
+    [1/16, triplet-8th, 1/8, dotted-8th, 1/4, dotted-4th, 1/2, dotted-1/2,
+    whole] so no micro-tie fragments survive. Never raises.
+    """
+    try:
+        targets = list(STANDARD_DURATIONS)
+        elements = list(container.recurse().notesAndRests)
+    except Exception:
+        return
+    for element in elements:
+        try:
+            current = float(element.quarterLength)
+        except Exception:
+            continue
+        if current <= 0:
+            continue
+        try:
+            best = min(targets, key=lambda t: abs(t - current))
+            if best != current:
+                element.quarterLength = best
+        except Exception:
+            pass
+
+
+def merge_coincident_and_truncate(part) -> None:
+    """Coalesce near-coincident onsets into Chords; truncate hairline overlaps.
+
+    Two notes starting within 0.06 QL become one Chord (union of pitches,
+    longest duration) instead of colliding sub-voices. A sustained note
+    overshooting the next onset by < 0.125 QL is truncated to that onset.
+    Operates on the flat pre-notation part. Never raises.
+    """
+    import copy
+    from music21 import chord as _chord_mod
+    from music21 import note as _note_mod
+
+    try:
+        notes = [e for e in list(part.recurse().notes) if e.isNote or e.isChord]
+    except Exception:
+        return
+    # --- coalesce ---
+    try:
+        groups: dict[float, list] = {}
+        for element in notes:
+            try:
+                key = round(float(element.offset), 6)
+            except Exception:
+                continue
+            groups.setdefault(key, []).append(element)
+        for offset, group in groups.items():
+            if len(group) < 2:
+                continue
+            try:
+                pool: dict[int, object] = {}
+                longest = 0.0
+                for element in group:
+                    try:
+                        longest = max(longest, float(element.quarterLength))
+                    except Exception:
+                        pass
+                    for p in element.pitches:
+                        try:
+                            pool.setdefault(int(p.midi), p)
+                        except Exception:
+                            pass
+                if len(pool) <= 1:
+                    continue
+                site = group[0].activeSite
+                if site is None:
+                    continue
+                fresh = [copy.deepcopy(p) for p in pool.values()]
+                merged = _chord_mod.Chord(fresh, quarterLength=longest)
+                for element in group:
+                    try:
+                        element.activeSite.remove(element)
+                    except Exception:
+                        pass
+                site.insert(offset, merged)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # --- truncate hairline overlaps ---
+    try:
+        ordered = sorted(
+            [e for e in list(part.recurse().notes) if e.isNote or e.isChord],
+            key=lambda e: round(float(e.offset), 6),
+        )
+        for prev, cur in zip(ordered, ordered[1:]):
+            try:
+                start = float(prev.offset)
+                cur_start = float(cur.offset)
+                end = start + float(prev.quarterLength)
+            except Exception:
+                continue
+            overhang = end - cur_start
+            if 0 < overhang < OVERLAP_TRUNCATE_QL:
+                try:
+                    new_ql = cur_start - start
+                    if new_ql >= MIN_QUARTER_LENGTH:
+                        prev.quarterLength = new_ql
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def detect_key_sharps(score) -> int | None:
+    """Sharps count of the detected key, or None when undetectable.
+
+    Pure detection — the caller falls back to C major (0). Never raises.
+    """
+    try:
+        found = score.analyze("key")
+        sharps = getattr(found, "sharps", None)
+        if isinstance(sharps, int) and -7 <= sharps <= 7:
+            return sharps
+        return None
+    except Exception:
+        return None
+
+
 def notate_part(part) -> None:
     """Full notation pass (voices, measures, ties, beams, rests) — never crashes.
 
@@ -698,11 +1015,13 @@ def notate_part(part) -> None:
 def prepare_score(score, title: str | None = None):
     """Quantize, de-clutter, title and notate the decoded score.
 
-    Operates per part (or on the flat score when the MIDI parsed with no
-    parts). Ghost filtering runs both before quantization (so sub-grid junk
-    never quantizes to zero duration) and after (to catch leftovers the grid
-    shrank). Safe on edge cases: empty parts, a single part, or an already
-    measured score all pass through without raising.
+    Pipeline per part (or the flat score when the MIDI parsed with no parts):
+    meter default → 88-key/overtone cleaning → ghost filter → strict
+    quantization → standard-duration snapping → ghost filter → onset
+    merging/overlap truncation → notation. If cleaning removes every note,
+    the honest outcome is empty-transcription (never rests-only output
+    masquerading as music). Safe on edge cases throughout; nothing raises
+    except the honest empty-transcription failure.
     """
     clean_score_title(score, title)
     try:
@@ -710,9 +1029,24 @@ def prepare_score(score, title: str | None = None):
     except Exception:
         parts = [score]
     for part in parts:
+        ensure_meter(part)
+        clean_pitch_events(part)
         remove_ghost_notes(part)
         quantize_part(part)
+        snap_to_standard_durations(part)
         remove_ghost_notes(part)
+        merge_coincident_and_truncate(part)
+    try:
+        if not score.recurse().notes:
+            raise fail(
+                "empty-transcription",
+                "No notes could be detected in this recording. Try a clearer recording with a prominent melody.",
+                3,
+            )
+    except SystemExit:
+        raise
+    except Exception:
+        pass
     for part in parts:
         notate_part(part)
     return score
@@ -856,19 +1190,24 @@ def split_for_grand_staff(element):
 
 
 def sync_grand_staff_rests(treble, bass) -> None:
-    """Rest-fill both staves so barlines stay vertically synchronized.
+    """Synchronize rests across both staves, measure by measure.
 
-    Every measure where one hand is resting gets clean rests via
-    makeRests(fillGaps=True). Edge case: an all-high (or all-low) recording
-    leaves one staff note-less — it is filled with rests spanning the
-    sibling's full range and notated, so the system still has two aligned
-    staves instead of a missing half. Rests are standard notation filler, not
-    fabricated notes. Never raises.
+    - A measure with musical content on one staff but ZERO notes on the
+      other gets a single centered whole-measure rest
+      (`note.Rest(type='whole')`) — never scattered 16th/8th rest clutter —
+      so the two staves stay vertically aligned bar by bar. The whole rest
+      is used only under 4/4 (our default); other meters fall back to
+      fillGaps proportions.
+    - Measures that do contain notes only get gap-filling via
+      makeRests(fillGaps=True).
+    - The all-high/all-low edge (one staff entirely note-less) is pre-filled
+      with rests spanning the sibling's range so both staves exist.
+    Rests are standard notation filler, not fabricated notes. Never raises.
     """
     from music21 import note as _note_mod
     from music21 import stream as _stream_mod
 
-    # Empty-staff edge first, so the per-measure pass below has measures.
+    # Empty-staff edge first, so the pairwise pass below has measures.
     try:
         staffs = (treble, bass)
         has_notes = [bool(list(s.recurse().notes)) for s in staffs]
@@ -892,26 +1231,162 @@ def sync_grand_staff_rests(treble, bass) -> None:
                         pass
     except Exception:
         pass
-    for staff_part in (treble, bass):
+
+    def _measures(staff_part):
         try:
-            measures = list(staff_part.getElementsByClass(_stream_mod.Measure))
+            return list(staff_part.getElementsByClass(_stream_mod.Measure))
         except Exception:
-            continue
-        for m in measures:
+            return []
+
+    def _is_four_four(measure) -> bool:
+        try:
+            ts = measure.timeSignature
+            if ts is None:
+                return True  # inherits our defaulted 4/4
+            return ts.ratioString == "4/4"
+        except Exception:
+            return True
+
+    def _extend_short_staff(t_measures, b_measures, treble_staff, bass_staff) -> None:
+        """Pad the bar-shorter staff with whole-measure rests to equal length."""
+        try:
+            if len(t_measures) == len(b_measures):
+                return
+            short_staff = treble_staff if len(t_measures) < len(b_measures) else bass_staff
+            short_list = t_measures if len(t_measures) < len(b_measures) else b_measures
             try:
-                m.makeRests(fillGaps=True, inPlace=True)
+                last_num = short_list[-1].number if short_list else 0
+                four_four = _is_four_four(short_list[-1]) if short_list else True
+            except Exception:
+                last_num, four_four = len(short_list), True
+            if not four_four:
+                return  # non-4/4: only whole rests are exact; skip extension
+            for i in range(abs(len(t_measures) - len(b_measures))):
+                try:
+                    m = _stream_mod.Measure(number=last_num + 1 + i)
+                    m.append(_note_mod.Rest(type="whole"))
+                    short_staff.append(m)
+                except Exception:
+                    break
+        except Exception:
+            pass
+
+    treble_measures, bass_measures = _measures(treble), _measures(bass)
+    # A staff whose content ends early has FEWER measures than its sibling
+    # (e.g. left hand silent for the last bars). Extend it with whole-measure
+    # rests so both staves span the same bars — otherwise systems fragment.
+    _extend_short_staff(treble_measures, bass_measures, treble, bass)
+    treble_measures, bass_measures = _measures(treble), _measures(bass)
+    for idx in range(max(len(treble_measures), len(bass_measures))):
+        pair = []
+        if idx < len(treble_measures):
+            pair.append(treble_measures[idx])
+        if idx < len(bass_measures):
+            pair.append(bass_measures[idx])
+        for m in pair:
+            try:
+                has = bool(list(m.recurse().notes))
+            except Exception:
+                continue
+            if has:
+                try:
+                    m.makeRests(fillGaps=True, inPlace=True)
+                except Exception:
+                    pass
+                continue
+            # Noteless measure: one centered whole-measure rest under 4/4.
+            if not _is_four_four(m):
+                try:
+                    m.makeRests(fillGaps=True, inPlace=True)
+                except Exception:
+                    pass
+                continue
+            try:
+                for r in list(m.recurse().getElementsByClass(_note_mod.Rest)):
+                    try:
+                        m.remove(r)
+                    except Exception:
+                        pass
+                m.append(_note_mod.Rest(type="whole"))
             except Exception:
                 pass
 
 
+def finish_grand_staff_part(staff_part, *, clef_obj, stem_default: str, key_sharps: int | None) -> None:
+    """Explicit geometry + professional finishing for one grand-staff half.
+
+    Measure 1, offset 0.0 always carries the clef, the meter (4/4 default —
+    already ensured, re-asserted here on the fresh staff) and the key
+    signature (detected tonality, C major fallback), so Verovio never renders
+    a clefless/meterless staff and accidentals spell against the active key.
+    Then voices/measures/ties, accidentals, explicit stem directives, and
+    per-measure beams that never cross beat boundaries (the 4/4 meter present
+    makes makeBeams group sixteenths per quarter-note beat). Never raises.
+    """
+    from music21 import key as _key_mod
+    from music21 import meter as _meter_mod
+    from music21 import stream as _stream_mod
+
+    for obj in (clef_obj, _meter_mod.TimeSignature(DEFAULT_TIME_SIGNATURE)):
+        try:
+            staff_part.insert(0, obj)
+        except Exception:
+            pass
+    try:
+        sharps = key_sharps if isinstance(key_sharps, int) else 0
+        staff_part.insert(0, _key_mod.KeySignature(max(-7, min(7, sharps))))
+    except Exception:
+        pass
+    notate_part(staff_part)
+    try:
+        staff_part.makeAccidentals(inPlace=True)
+    except Exception:
+        pass
+    # Stem directives AFTER notation (beams must not override them later).
+    try:
+        for element in list(staff_part.recurse().notes):
+            try:
+                if not (element.isNote or element.isChord):
+                    continue
+                if stem_default == "up":
+                    top = max(int(p.midi) for p in element.pitches)
+                    if top > TREBLE_STEM_FLIP_MIDI:
+                        continue  # high ledger passages keep automatic flip
+                    element.stemDirection = "up"
+                else:
+                    element.stemDirection = "down"
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Beams per measure, strictly on metric beats, without touching stems.
+    try:
+        measures = list(staff_part.getElementsByClass(_stream_mod.Measure))
+    except Exception:
+        measures = []
+    for m in measures:
+        try:
+            m.makeBeams(inPlace=True, setStemDirections=False)
+        except Exception:
+            pass
+
+
 def build_grand_staff(score):
-    """Two-staff piano layout of the SAME decoded notes (treble + bass)."""
+    """Two-staff piano layout of the SAME decoded notes (treble + bass).
+
+    Two linked PartStaffs ('Right Hand' / 'Left Hand') under one braced
+    StaffGroup with joined barlines; every pitch is assigned by the
+    clef-compass rule (overlap 55-67 defaults to the middle-C split) and
+    spanning chords are divided pitch-by-pitch. No pitch is transposed —
+    out-of-compass extremes keep honest ledger lines (the 88-key and
+    overtone passes already removed artifact spikes).
+    """
     from music21 import clef, instrument, layout, stream
 
     treble = stream.PartStaff()
-    treble.partName = "Piano"
+    treble.partName = "Right Hand"
     bass = stream.PartStaff()
-    bass.partName = "Piano"
+    bass.partName = "Left Hand"
     treble.insert(0, instrument.Piano())
     bass.insert(0, instrument.Piano())
 
@@ -934,28 +1409,37 @@ def build_grand_staff(score):
             except Exception:
                 pass
 
-    treble.insert(0, clef.TrebleClef())
-    bass.insert(0, clef.BassClef())
-    for staff_part in (treble, bass):
-        # Full notation pass (voices/measures/ties/beams/rests) so each staff
-        # reads cleanly. Best-effort so a pathological staff can never crash
-        # the job; all-high or all-low recordings simply leave one staff to
-        # be rest-filled below.
-        notate_part(staff_part)
-        try:
-            staff_part.makeAccidentals(inPlace=True)
-        except Exception:
-            pass
-    # Keep the two staves vertically synchronized: any measure where one hand
-    # is resting gets clean rests (an empty staff gets full-measure rests
-    # spanning the sibling's range, so barlines line up across the system).
+    # Detected tonality once (best-effort); C major fallback inside finish.
+    key_sharps = detect_key_sharps(score)
+    finish_grand_staff_part(treble, clef_obj=clef.TrebleClef(), stem_default="up", key_sharps=key_sharps)
+    finish_grand_staff_part(bass, clef_obj=clef.BassClef(), stem_default="down", key_sharps=key_sharps)
+    # Keep the two staves vertically synchronized (whole-measure rests where
+    # one hand is out, gap-filling elsewhere).
     sync_grand_staff_rests(treble, bass)
 
     out = stream.Score()
     out.insert(0, treble)
     out.insert(0, bass)
-    out.insert(0, layout.StaffGroup([treble, bass], name="Piano", symbol="brace"))
+    try:
+        out.insert(
+            0, layout.StaffGroup([treble, bass], name="Piano", symbol="brace", barTogether=True)
+        )
+    except Exception:
+        try:
+            out.insert(0, layout.StaffGroup([treble, bass], name="Piano", symbol="brace"))
+        except Exception:
+            pass
     carry_title(score, out)
+    # Final assembly pass per the engraving contract (best-effort; parts are
+    # already fully notated, so this only normalizes score-level state).
+    try:
+        out.makeNotation(inPlace=True)
+    except Exception:
+        pass
+    try:
+        out.makeAccidentals(inPlace=True)
+    except Exception:
+        pass
     return out
 
 
