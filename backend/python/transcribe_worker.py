@@ -67,9 +67,11 @@ SHEET_TYPES = ("melody-chords", "piano-grand", "lead-sheet")
 GRAND_STAFF_SPLIT_MIDI = 60
 
 # --- Notation cleanup (MIR engraving) ---
-# Strict, standard grid: 16th notes plus triplets. Anything finer (32nds and
-# below) snaps up to this grid instead of engraving as 64th/128th clutter.
-QUANTIZE_DIVISORS = (4, 3)
+# Strict musical grid: 16ths, 8th-note triplets AND 16th-note triplets, so
+# compound meters (6/8, 9/8) and triplet feels snap to the lattice instead of
+# engraving as fragmented, syncopated ties. Anything finer snaps up instead
+# of rendering as 64th/128th clutter.
+QUANTIZE_DIVISORS = (4, 3, 6)
 # Below a 64th note (~a 128th): micro-duration artifacts / ghost notes from
 # the model that cause extreme micro-ties and beam clutter. Dropped, never
 # rendered. (At 120 BPM a 64th is ~31 ms, a 32nd ~62 ms, so this keeps real
@@ -94,10 +96,11 @@ ONSET_MERGE_QL = 0.06
 OVERLAP_TRUNCATE_QL = 0.125
 # Conservative meter default when the MIDI carries none.
 DEFAULT_TIME_SIGNATURE = "4/4"
-# Explicit-measure grand-staff builder: strict event lengths (triplets are
-# resolved upstream; cross-barline spans become tied fragments) and the ghost
-# floor below which a blip is pruned rather than engraved.
-CLEAN_DURATIONS = (0.25, 0.5, 0.75, 1.0, 2.0, 4.0)
+# Explicit-measure grand-staff builder: strict event lengths (triplet-8ths
+# and dotted-quarter beats included for compound/triplet feels; cross-barline
+# spans become tied fragments) and the ghost floor below which a blip is
+# pruned rather than engraved.
+CLEAN_DURATIONS = (0.25, 1.0 / 3.0, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0)
 CLEAN_GHOST_QL = 0.20
 CLEAN_BAR_QL = 4.0
 # music21's default score title when parsing MIDI; always replaced below.
@@ -1060,21 +1063,6 @@ def merge_coincident_and_truncate(part) -> None:
         pass
 
 
-def detect_key_sharps(score) -> int | None:
-    """Sharps count of the detected key, or None when undetectable.
-
-    Pure detection — the caller falls back to C major (0). Never raises.
-    """
-    try:
-        found = score.analyze("key")
-        sharps = getattr(found, "sharps", None)
-        if isinstance(sharps, int) and -7 <= sharps <= 7:
-            return sharps
-        return None
-    except Exception:
-        return None
-
-
 def notate_part(part) -> None:
     """Full notation pass (voices, measures, ties, beams, rests) — never crashes.
 
@@ -1226,6 +1214,121 @@ def wants_grand_staff(sheet_type: str, instruments) -> bool:
         return sheet_type == "piano-grand"
 
 
+def analyze_musical_context(source_stream) -> tuple:
+    """Dynamic key + meter detection for the grand-staff builder.
+
+    Returns (key.Key | None, TimeSignature | None) — freshly analyzed, never
+    defaulted here; the caller falls back to C major / 4/4. Fully guarded:
+    - Key via `analyze('key')` (genuine tonal analysis of the decoded notes).
+    - Meter via `analyze('meter')` first, exactly as specified (music21 has
+      no such analyzer today, so this raises and is caught), then a carried
+      TimeSignature from the source MIDI when the transcription wrote one
+      (real notated meter, e.g. from the beat grid), validated for sanity.
+      music21's `meter.bestTimeSignature()` is deliberately NOT used: on an
+      unbarred stream it degenerates to whole-stream-as-one-bar (8/4, 3/2),
+      which would engrave worse than the honest 4/4 fallback.
+    Never raises; returns (None, None) when nothing is detectable.
+    """
+    key_obj = None
+    time_sig = None
+    try:
+        found_key = source_stream.analyze("key")
+        from music21 import key as _key_mod
+
+        if isinstance(found_key, _key_mod.Key):
+            key_obj = found_key
+    except Exception:
+        key_obj = None
+    try:
+        found_meter = source_stream.analyze("meter")
+        if _is_sane_time_signature(found_meter):
+            time_sig = found_meter
+    except Exception:
+        pass
+    if time_sig is None:
+        try:
+            from music21 import meter as _meter_mod
+
+            carried = list(source_stream.flatten().getElementsByClass(_meter_mod.TimeSignature))
+            if carried and _is_sane_time_signature(carried[0]):
+                time_sig = carried[0]
+        except Exception:
+            pass
+    return key_obj, time_sig
+
+
+def _is_sane_time_signature(candidate) -> bool:
+    """Accept only well-formed, engravable meters (guards heuristic output)."""
+    try:
+        from music21 import meter as _meter_mod
+
+        if not isinstance(candidate, _meter_mod.TimeSignature):
+            return False
+        return (
+            1 <= int(candidate.numerator) <= 12
+            and int(candidate.denominator) in (2, 4, 8, 16)
+        )
+    except Exception:
+        return False
+
+
+def meter_bar_length(time_sig) -> float:
+    """QuarterLengths per bar for a meter (4/4 -> 4.0, 6/8 -> 3.0)."""
+    try:
+        return float(int(time_sig.numerator) * (4.0 / int(time_sig.denominator)))
+    except Exception:
+        return CLEAN_BAR_QL
+
+
+def truncate_overlapping_events(events: list) -> list:
+    """Force strict monophonic/block-chord linearity within one hand.
+
+    Sustain-pedal bleed makes note A overlap note B's onset; notation would
+    then spawn competing voices with colliding stems and micro-rests. Each
+    event is a dict {offset, pitches, ql, tie}: sorted by offset, an event
+    overlapping the next onset is truncated to end exactly there — UNLESS
+    both share the onset (a true block chord, exempt). A truncated length is
+    floor-snapped to the largest standard duration fitting the gap (never
+    rounded up into the next note); a gap below the ghost floor prunes the
+    event. Same pitches, same onsets — only overlaps removed. Never raises.
+    """
+    try:
+        ordered = sorted(events, key=lambda e: round(float(e.get("offset", 0.0)), 6))
+    except Exception:
+        return events
+    kept = []
+    for index, event in enumerate(ordered):
+        try:
+            start = round(float(event.get("offset", 0.0)), 6)
+            length = float(event.get("ql", 0.0))
+        except Exception:
+            continue
+        if length <= 0:
+            continue
+        try:
+            nxt = ordered[index + 1]
+            nxt_start = round(float(nxt.get("offset", 0.0)), 6)
+        except Exception:
+            nxt_start = None
+        if nxt_start is not None and nxt_start > start and start + length > nxt_start:
+            gap = round(nxt_start - start, 6)
+            floored = None
+            try:
+                candidates = [t for t in CLEAN_DURATIONS if t <= gap + 1e-9]
+                floored = max(candidates) if candidates else None
+            except Exception:
+                floored = None
+            if floored is None:
+                continue  # sliver too short to notate: prune, don't clutter
+            try:
+                event = dict(event)
+                event["ql"] = floored
+            except Exception:
+                pass
+        kept.append(event)
+    return kept
+
+
 def _snap_clean_duration(ql) -> float | None:
     """Nearest strict grand-staff length, or None below the ghost floor.
 
@@ -1247,7 +1350,7 @@ def _snap_clean_duration(ql) -> float | None:
         return None
 
 
-def _ensure_builder_measure(part, idx, _stream_mod, _note_mod):
+def _ensure_builder_measure(part, idx, _stream_mod, _note_mod, bar_ql=CLEAN_BAR_QL):
     """Return measure idx, appending numbered whole-rest-ready bars as needed."""
     try:
         measures = list(part.getElementsByClass(_stream_mod.Measure))
@@ -1266,19 +1369,27 @@ def _ensure_builder_measure(part, idx, _stream_mod, _note_mod):
         return None
 
 
-def _place_event_with_ties(part, start, pitch_objs, ql, stem, _stream_mod, _note_mod, _chord_mod, _tie_mod, source_tie=None) -> None:
+def _place_event_with_ties(part, start, pitch_objs, ql, stem, _stream_mod, _note_mod, _chord_mod, _tie_mod, source_tie=None, bar_ql=CLEAN_BAR_QL) -> None:
     """Insert one partitioned event, splitting across barlines with ties.
 
-    A note longer than the remaining bar is divided into tied fragments so no
-    <note> ever overflows its <measure> (overflowing durations are exactly
-    what renders as headless stems in Verovio). Fragments are exact barline
-    subdivisions of an already-standard duration — the ties make them one
-    musical event, not invented notes. When the event already fits one bar,
-    an upstream tie (from the prepared score's own barline split) is carried
-    over so tie chains survive the rebuild. Best-effort; never raises.
+    Bar length comes from the detected meter (4/4 -> 4.0, 6/8 -> 3.0) so
+    fragments respect the actual barlines. A note longer than the remaining
+    bar is divided into tied fragments so no <note> ever overflows its
+    <measure> (overflowing durations are exactly what renders as headless
+    stems in Verovio). Fragments are exact barline subdivisions of an
+    already-standard duration — the ties make them one musical event, not
+    invented notes. When the event already fits one bar, an upstream tie
+    (from the prepared score's own barline split) is carried over so tie
+    chains survive the rebuild. Best-effort; never raises.
     """
     import copy
 
+    try:
+        bar_ql = float(bar_ql)
+        if not math.isfinite(bar_ql) or bar_ql <= 0:
+            bar_ql = CLEAN_BAR_QL
+    except Exception:
+        bar_ql = CLEAN_BAR_QL
     try:
         remaining = round(float(ql), 6)
         cur = round(float(start), 6)
@@ -1297,15 +1408,15 @@ def _place_event_with_ties(part, start, pitch_objs, ql, stem, _stream_mod, _note
     while remaining > 1e-9 and guard < 64:
         guard += 1
         try:
-            m_idx = int(cur // CLEAN_BAR_QL)
+            m_idx = int(cur // bar_ql)
             measure = _ensure_builder_measure(part, m_idx, _stream_mod, _note_mod)
             if measure is None:
                 return
-            m_start = m_idx * CLEAN_BAR_QL
+            m_start = m_idx * bar_ql
             in_meas = round(cur - m_start, 6)
-            space = round(CLEAN_BAR_QL - in_meas, 6)
+            space = round(bar_ql - in_meas, 6)
             if space <= 1e-9:
-                cur = round(m_start + CLEAN_BAR_QL, 6)
+                cur = round(m_start + bar_ql, 6)
                 continue
             frag = min(remaining, space)
             if frag <= 1e-9:
@@ -1351,11 +1462,15 @@ def generate_clean_grand_staff(source_stream, title="Piano Transcription"):
     """Explicit measure-by-measure Grand Staff, built valid from the ground up.
 
     Two distinct Parts under a braced, barline-joined StaffGroup; measures
-    pre-populated with clef + meter (+ detected key) in bar 1; events
+    pre-populated with clef + dynamically analyzed meter and key in bar 1
+    (compound meters like 6/8 set the true bar length; the analyzed Key
+    object pushes repetitive accidentals into the signature); events
     extracted from the flattened source at absolute offsets, clamped to
-    strict lengths, partitioned strictly at middle C, and laid into measures
-    with tie-splitting so no note ever overflows a barline; empty bars get
-    whole rests, gapped bars get fillGaps rests, beams preserve explicit
+    strict lengths (triplet-8ths and dotted-quarter beats included),
+    partitioned strictly at middle C, de-overlapped per hand for strict
+    monophonic/block-chord linearity, and laid into measures with
+    tie-splitting so no note ever overflows a barline; empty bars get
+    full-bar rests, gapped bars get fillGaps rests, beams preserve explicit
     stems. Only genuinely decoded pitches are engraved. Best-effort
     throughout — never raises.
     """
@@ -1412,20 +1527,31 @@ def generate_clean_grand_staff(source_stream, title="Piano Transcription"):
     except Exception:
         events = []
 
+    # Dynamic musical analysis (key + meter), each guarded: detection runs
+    # first, the honest 4/4 + C-major fallback applies when it fails.
+    try:
+        predicted_key, predicted_meter = analyze_musical_context(source_stream)
+    except Exception:
+        predicted_key, predicted_meter = None, None
+    try:
+        bar_ql = meter_bar_length(predicted_meter) if predicted_meter is not None else CLEAN_BAR_QL
+        if not math.isfinite(bar_ql) or bar_ql <= 0:
+            bar_ql = CLEAN_BAR_QL
+    except Exception:
+        bar_ql = CLEAN_BAR_QL
+    try:
+        meter_ratio = predicted_meter.ratioString if predicted_meter is not None else DEFAULT_TIME_SIGNATURE
+    except Exception:
+        meter_ratio = DEFAULT_TIME_SIGNATURE
+
     try:
         max_end = max(float(n.offset) + float(n.quarterLength) for n in events) if events else 0.0
     except Exception:
         max_end = 0.0
     try:
-        num_measures = max(1, int(math.ceil(max_end / CLEAN_BAR_QL)))
+        num_measures = max(1, int(math.ceil(max_end / bar_ql)))
     except Exception:
         num_measures = 1
-
-    try:
-        key_sharps = detect_key_sharps(source_stream)
-        sharps = key_sharps if isinstance(key_sharps, int) else 0
-    except Exception:
-        sharps = 0
 
     for m_num in range(1, num_measures + 1):
         try:
@@ -1434,16 +1560,25 @@ def generate_clean_grand_staff(source_stream, title="Piano Transcription"):
         except Exception:
             continue
         if m_num == 1:
+            # The analyzed Key object itself (not just its sharps) so mode
+            # and tonic spell correctly; deep-copied per staff, C-major fallback.
+            try:
+                import copy as _copy
+
+                key_upper = _copy.deepcopy(predicted_key) if predicted_key is not None else None
+                key_lower = _copy.deepcopy(predicted_key) if predicted_key is not None else None
+            except Exception:
+                key_upper = key_lower = None
             try:
                 m_upper.append(_clef_mod.TrebleClef())
-                m_upper.append(_meter_mod.TimeSignature(DEFAULT_TIME_SIGNATURE))
-                m_upper.append(_key_mod.KeySignature(max(-7, min(7, sharps))))
+                m_upper.append(_meter_mod.TimeSignature(meter_ratio))
+                m_upper.append(key_upper if key_upper is not None else _key_mod.KeySignature(0))
             except Exception:
                 pass
             try:
                 m_lower.append(_clef_mod.BassClef())
-                m_lower.append(_meter_mod.TimeSignature(DEFAULT_TIME_SIGNATURE))
-                m_lower.append(_key_mod.KeySignature(max(-7, min(7, sharps))))
+                m_lower.append(_meter_mod.TimeSignature(meter_ratio))
+                m_lower.append(key_lower if key_lower is not None else _key_mod.KeySignature(0))
             except Exception:
                 pass
         try:
@@ -1455,10 +1590,14 @@ def generate_clean_grand_staff(source_stream, title="Piano Transcription"):
         except Exception:
             pass
 
+    # Phase 1 — partition the flattened source into per-hand event lists.
+    # Strict middle-C rule, snapped lattice durations, upstream ties kept.
+    upper_events: list = []
+    lower_events: list = []
     for element in events:
         try:
             try:
-                offset = float(element.offset)
+                offset = round(float(element.offset), 6)
             except Exception:
                 continue
             snapped = _snap_clean_duration(element.quarterLength)
@@ -1478,32 +1617,53 @@ def generate_clean_grand_staff(source_stream, title="Piano Transcription"):
                 high = [p for p in pitches if int(p.midi) >= GRAND_STAFF_SPLIT_MIDI]
                 low = [p for p in pitches if int(p.midi) < GRAND_STAFF_SPLIT_MIDI]
                 if high:
-                    _place_event_with_ties(
-                        p_upper, offset, high, snapped, "up",
-                        _stream_mod, _note_mod, _chord_mod, _tie_mod, src_tie,
+                    upper_events.append(
+                        {"offset": offset, "pitches": high, "ql": snapped, "tie": src_tie}
                     )
                 if low:
-                    _place_event_with_ties(
-                        p_lower, offset, low, snapped, "down",
-                        _stream_mod, _note_mod, _chord_mod, _tie_mod, src_tie,
+                    lower_events.append(
+                        {"offset": offset, "pitches": low, "ql": snapped, "tie": src_tie}
                     )
             else:
                 try:
                     midi = int(pitches[0].midi)
                 except Exception:
                     continue
+                entry = {"offset": offset, "pitches": [pitches[0]], "ql": snapped, "tie": src_tie}
                 if midi >= GRAND_STAFF_SPLIT_MIDI:
-                    _place_event_with_ties(
-                        p_upper, offset, [pitches[0]], snapped, "up",
-                        _stream_mod, _note_mod, _chord_mod, _tie_mod, src_tie,
-                    )
+                    upper_events.append(entry)
                 else:
-                    _place_event_with_ties(
-                        p_lower, offset, [pitches[0]], snapped, "down",
-                        _stream_mod, _note_mod, _chord_mod, _tie_mod, src_tie,
-                    )
+                    lower_events.append(entry)
         except Exception:
             pass
+
+    # Phase 2 — arpeggio-bleed cleanup per hand BEFORE measure placement
+    # (the explicit-measure equivalent of the pre-makeNotation pass): pedal
+    # sustain makes A overlap B's onset, which would otherwise force competing
+    # voices with colliding stems. Truncate to strict linearity instead.
+    try:
+        upper_events = truncate_overlapping_events(upper_events)
+    except Exception:
+        pass
+    try:
+        lower_events = truncate_overlapping_events(lower_events)
+    except Exception:
+        pass
+
+    # Phase 3 — place into measures with tie-split barline crossings.
+    for side_events, part, stem in (
+        (upper_events, p_upper, "up"),
+        (lower_events, p_lower, "down"),
+    ):
+        for event in side_events:
+            try:
+                _place_event_with_ties(
+                    part, event["offset"], event["pitches"], event["ql"], stem,
+                    _stream_mod, _note_mod, _chord_mod, _tie_mod, event.get("tie"),
+                    bar_ql,
+                )
+            except Exception:
+                pass
 
     for part in (p_upper, p_lower):
         try:
@@ -1517,7 +1677,7 @@ def generate_clean_grand_staff(source_stream, title="Piano Transcription"):
                 continue
             if not has_notes:
                 try:
-                    m.insert(0.0, _note_mod.Rest(quarterLength=CLEAN_BAR_QL))
+                    m.insert(0.0, _note_mod.Rest(quarterLength=bar_ql))
                 except Exception:
                     pass
                 continue
@@ -1528,12 +1688,12 @@ def generate_clean_grand_staff(source_stream, title="Piano Transcription"):
             try:
                 # Deterministic bar completeness: fillGaps can leave a tied
                 # fragment's bar short (Verovio then misaligns systems), so
-                # top up any remainder to the full 4/4 bar with rests.
+                # top up any remainder to the full detected bar with rests.
                 try:
                     filled = round(float(m.highestTime), 6)
                 except Exception:
-                    filled = CLEAN_BAR_QL
-                pad = round(CLEAN_BAR_QL - filled, 6)
+                    filled = bar_ql
+                pad = round(bar_ql - filled, 6)
                 if pad > 1e-6:
                     m.insert(max(0.0, filled), _note_mod.Rest(quarterLength=pad))
             except Exception:
