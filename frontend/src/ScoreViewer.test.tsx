@@ -59,6 +59,19 @@ it('pans the workspace with a mouse drag without breaking the page', async () =>
   expect(screen.getByRole('img', { name: 'Sheet music, page 1' })).toBeInTheDocument()
 })
 
+it('mounts every Verovio page so long scores are never cut short', async () => {
+  verovio.pageCount = 25
+  const onReady = vi.fn()
+  render(<ScoreViewer xml="<score-partwise version='4.0'/>" onReady={onReady} onRenderFailure={vi.fn()} />)
+  expect(await screen.findByText(/25 pages · MusicXML notation/)).toBeInTheDocument()
+  const pages = screen.getAllByRole('img')
+  expect(pages).toHaveLength(25)
+  // First AND final systems reachable in DOM order — no stopping point.
+  expect(pages[0]).toHaveAttribute('aria-label', 'Sheet music, page 1')
+  expect(pages[24]).toHaveAttribute('aria-label', 'Sheet music, page 25')
+  expect(onReady).toHaveBeenCalledTimes(1)
+})
+
 it('shows an inline message when Verovio refuses the score, without blaming the backend', async () => {
   verovio.loadData = false
   const onReady = vi.fn()
