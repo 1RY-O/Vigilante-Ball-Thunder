@@ -73,6 +73,32 @@ class ScoreRejected extends Error {}
 /** Thrown before Verovio is even loaded: this browser cannot run WebAssembly. */
 class WasmUnavailable extends Error {}
 
+/**
+ * The exact DOMPurify configuration applied to Verovio's SVG output.
+ *
+ * Verovio 6.3.0 engraves every SMuFL glyph (noteheads, clefs, accidentals,
+ * rest symbols) as `<use xlink:href="#…">` sprite references into `<defs>`.
+ * DOMPurify's stock `svg` profile strips those references, which renders as
+ * intact staff lines and labels but headless, clefless floating stems. The
+ * `ADD_TAGS`/`ADD_ATTR` below re-allow exactly the sprite mechanism and
+ * nothing else: event-handler attributes, `<script>`, and dangerous URI
+ * schemes (e.g. `javascript:`) are still removed by DOMPurify's defaults.
+ */
+export const NOTATION_SANITIZE_CONFIG: {
+  USE_PROFILES: { svg: boolean; svgFilters: boolean }
+  ADD_TAGS: string[]
+  ADD_ATTR: string[]
+} = {
+  USE_PROFILES: { svg: true, svgFilters: true },
+  ADD_TAGS: ['use'],
+  ADD_ATTR: ['href', 'xlink:href'],
+}
+
+/** Sanitize one Verovio SVG page with the production configuration. Exported for tests. */
+export function sanitizeNotationSVG(svg: string): string {
+  return DOMPurify.sanitize(svg, { ...NOTATION_SANITIZE_CONFIG })
+}
+
 let modulePromise: Promise<unknown> | undefined
 async function renderScore(xml: string) {
   // Hardened browsers (e.g. Cromite with JavaScript JIT off) expose no
@@ -93,7 +119,7 @@ async function renderScore(xml: string) {
     // buildTimeline below, and only while the feature flag is on.
     toolkit.setOptions({ inputFrom: 'musicxml', pageWidth: 2100, pageHeight: 2970, scale: 40, adjustPageHeight: true, footer: 'none' })
     if (!toolkit.loadData(xml) || !toolkit.getPageCount()) throw new ScoreRejected('Verovio rejected the score')
-    const pages = Array.from({ length: toolkit.getPageCount() }, (_, i) => DOMPurify.sanitize(toolkit!.renderToSVG(i + 1), { USE_PROFILES: { svg: true, svgFilters: true } }))
+    const pages = Array.from({ length: toolkit.getPageCount() }, (_, i) => sanitizeNotationSVG(toolkit!.renderToSVG(i + 1)))
     const timeline = ENABLE_NOTE_HIGHLIGHTING ? buildTimeline(toolkit) : []
     return { pages, timeline }
   } finally { toolkit?.destroy() }

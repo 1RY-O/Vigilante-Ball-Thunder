@@ -592,12 +592,14 @@ def _emit_token_summary(stats: dict) -> None:
 def load_score(midi_path: str, title: str | None = None):
     """Parse the decoded MIDI with music21 (real notes, or honest failure).
 
-    The parsed score is then quantized, de-cluttered and notated (real notes
-    only — see prepare_score); nothing is ever invented.
+    The parsed score is normalized to flat parts (see
+    _normalize_parsed_score), then quantized, de-cluttered and notated (real
+    notes only — see prepare_score); nothing is ever invented.
     """
     from music21 import converter
 
     score = converter.parse(midi_path)
+    score = _normalize_parsed_score(score)
     if not score.recurse().notes:
         raise fail(
             "empty-transcription",
@@ -605,6 +607,91 @@ def load_score(midi_path: str, title: str | None = None):
             3,
         )
     return prepare_score(score, title)
+
+
+def _normalize_parsed_score(score):
+    """Flatten MIDI-imported parts so every later pass sees absolute offsets.
+
+    `converter.parse()` of MIDI returns Parts already divided into Measures
+    (one per MIDI track segment), so a note's `.offset` is measure-relative
+    while `getOffsetInHierarchy()` is absolute. Passes written against
+    `.offset` (onset merging, overtone windows, quantization) then teleport
+    notes across bars — merging bar 2 material into bar 1 chords and dropping
+    tie fragments. Normalizing once at this boundary fixes the whole class:
+    each part becomes a flat sequence at absolute offsets, carrying over its
+    time signature, tempo marks, instruments and clefs (deep-copied, never
+    reparented). Scores that are already flat are returned untouched. Never
+    raises — on any failure the original score passes through.
+    """
+    try:
+        from music21 import clef as _clef_mod
+        from music21 import instrument as _instrument_mod
+        from music21 import meter as _meter_mod
+        from music21 import stream as _stream_mod
+        from music21 import tempo as _tempo_mod
+    except Exception:
+        return score
+    try:
+        parts = list(score.parts)
+    except Exception:
+        return score
+    if not parts:
+        return score
+    try:
+        import copy as _copy
+    except Exception:
+        return score
+    new_parts = []
+    try:
+        for part in parts:
+            try:
+                flat = part.flatten()
+            except Exception:
+                continue
+            new_part = _stream_mod.Part()
+            try:
+                if part.partName:
+                    new_part.partName = part.partName
+            except Exception:
+                pass
+            try:
+                for el in list(flat.elements):
+                    if isinstance(el, (_meter_mod.TimeSignature, _tempo_mod.TempoIndication,
+                                      _instrument_mod.Instrument, _clef_mod.Clef)):
+                        try:
+                            new_part.insert(round(float(el.offset), 6), _copy.deepcopy(el))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            try:
+                for el in list(flat.notesAndRests):
+                    try:
+                        new_part.insert(round(float(el.offset), 6), el)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            new_parts.append(new_part)
+    except Exception:
+        return score
+    if not new_parts:
+        return score
+    try:
+        out = _stream_mod.Score()
+    except Exception:
+        return score
+    try:
+        if score.metadata is not None:
+            out.metadata = score.metadata
+    except Exception:
+        pass
+    for new_part in new_parts:
+        try:
+            out.append(new_part)
+        except Exception:
+            pass
+    return out
 
 
 def clean_score_title(score, title: str | None) -> None:

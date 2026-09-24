@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <work><work-title>Minimal grand-staff probe</work-title></work>
+  <part-list>
+    <part-group number="1" type="start">
+      <group-name>Piano</group-name>
+      <group-symbol>brace</group-symbol>
+      <group-barline>yes</group-barline>
+    </part-group>
+    <score-part id="P1"><part-name>Right Hand</part-name></score-part>
+    <score-part id="P2"><part-name>Left Hand</part-name></score-part>
+    <part-group number="1" type="stop" />
+  </part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>4</divisions>
+        <key><fifths>0</fifths></key>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <clef><sign>G</sign><line>2</line></clef>
+      </attributes>
+      <note>
+        <pitch><step>C</step><octave>5</octave></pitch>
+        <duration>4</duration><voice>1</voice><type>quarter</type><stem>up</stem>
+      </note>
+      <note>
+        <chord />
+        <pitch><step>E</step><octave>5</octave></pitch>
+        <duration>4</duration><voice>1</voice><type>quarter</type><stem>up</stem>
+      </note>
+      <note>
+        <pitch><step>D</step><octave>5</octave></pitch>
+        <duration>2</duration><voice>1</voice><type>eighth</type><stem>up</stem><beam number="1">begin</beam>
+      </note>
+      <note>
+        <pitch><step>E</step><octave>5</octave></pitch>
+        <duration>2</duration><voice>1</voice><type>eighth</type><stem>up</stem><beam number="1">end</beam>
+      </note>
+      <note>
+        <pitch><step>G</step><octave>4</octave></pitch>
+        <duration>8</duration><voice>1</voice><type>half</type><stem>up</stem>
+        <notations><tied type="start" /></notations>
+      </note>
+    </measure>
+    <measure number="2">
+      <note>
+        <pitch><step>G</step><octave>4</octave></pitch>
+        <duration>8</duration><voice>1</voice><type>half</type><stem>up</stem>
+        <notations><tied type="stop" /></notations>
+      </note>
+      <note><rest /><duration>8</duration><voice>1</voice><type>half</type></note>
+    </measure>
+  </part>
+  <part id="P2">
+    <measure number="1">
+      <attributes>
+        <divisions>4</divisions>
+        <key><fifths>0</fifths></key>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <clef><sign>F</sign><line>4</line></clef>
+      </attributes>
+      <note>
+        <pitch><step>C</step><octave>3</octave></pitch>
+        <duration>8</duration><voice>1</voice><type>half</type><stem>down</stem>
+      </note>
+      <note><rest /><duration>8</duration><voice>1</voice><type>half</type></note>
+    </measure>
+    <measure number="2">
+      <note><rest measure="yes" /><duration>16</duration><voice>1</voice></note>
+    </measure>
+  </part>
+</score-partwise>
