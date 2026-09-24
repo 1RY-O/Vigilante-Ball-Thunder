@@ -1,18 +1,22 @@
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { RemoteMuScriptorEngine } from '../src/services/transcription/remoteEngine.js';
-import { EngineUnavailableError, TranscriptionError } from '../src/services/transcription/engine.js';
+import { CancelledError, EngineUnavailableError, TranscriptionError } from '../src/services/transcription/engine.js';
 import type { TranscribeRequest } from '../src/services/transcription/engine.js';
 
 /**
- * Remote engine honesty guards: the engine must refuse to fabricate
- * artifacts (no placeholder MusicXML), surface unreachable workers as
- * 503-class errors, and write nothing when the worker's payload is invalid.
+ * Remote engine honesty + async-protocol guards. The worker speaks
+ * submit/poll (POST /transcribe -> 202 {jobId}, GET /jobs/{id} ->
+ * processing/completed/error), so every stub below implements that
+ * protocol: the engine must refuse to fabricate artifacts, surface
+ * unreachable workers as 503-class errors, and write nothing when the
+ * worker's payload is invalid.
  */
 describe('RemoteMuScriptorEngine', () => {
   let tmpRoot = '';
@@ -29,16 +33,47 @@ describe('RemoteMuScriptorEngine', () => {
     if (tmpRoot) await fs.rm(tmpRoot, { recursive: true, force: true });
   });
 
-  function req(audioPath: string, outDir: string): TranscribeRequest {
+  function req(audioPath: string, outDir: string, signal?: AbortSignal): TranscribeRequest {
     return {
       audioPath,
       outDir,
       model: 'small',
       sheetType: 'melody-chords',
       instrumentGroups: [],
-      signal: AbortSignal.timeout(15_000),
+      signal: signal ?? AbortSignal.timeout(20_000),
     };
   }
+
+  /** Scripted async worker: 202 on submit, then the given poll bodies in order. */
+  async function startAsyncStub(pollBodies: unknown[], submitStatus = 202): Promise<{ server: Server; url: string; seen: { posts: number; polls: number } }> {
+    const seen = { posts: 0, polls: 0 };
+    const server = createServer((nodeReq: IncomingMessage, res: ServerResponse) => {
+      nodeReq.resume();
+      nodeReq.on('end', () => {
+        res.writeHead(submitStatus === 202 && nodeReq.method === 'POST' ? 202 : 200, { 'content-type': 'application/json' });
+        if (nodeReq.method === 'POST' && nodeReq.url === '/transcribe') {
+          seen.posts += 1;
+          res.end(JSON.stringify({ jobId: 'abc123', status: 'processing' }));
+          return;
+        }
+        seen.polls += 1;
+        const body = pollBodies[Math.min(seen.polls - 1, pollBodies.length - 1)];
+        res.end(JSON.stringify(body));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    return { server, url, seen };
+  }
+
+  const GOOD_RESULT = (midiB64: string) => ({
+    status: 'completed',
+    result: {
+      midiBase64: midiB64,
+      musicXml: '<?xml version="1.0"?><score-partwise version="4.0"><part id="P1"/></score-partwise>',
+      metadata: { durationSec: 15.0, detectedInstruments: ['piano'], tempoBpm: 120, keyName: 'C minor' },
+    },
+  });
 
   it('reports offline (not fabricated success) when no worker listens', async () => {
     const engine = new RemoteMuScriptorEngine('http://127.0.0.1:9');
@@ -55,24 +90,21 @@ describe('RemoteMuScriptorEngine', () => {
     expect(avail.code).toBe('remote-worker-unconfigured');
   });
 
-  it('writes both real artifacts and returns worker metadata', async () => {
+  it('submits then polls to completion, writing both real artifacts', async () => {
     const midiBytes = Buffer.from([0x4d, 0x54, 0x68, 0x64, 0x00]);
-    const server = createServer((_req, res) => {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({
-        midiBase64: midiBytes.toString('base64'),
-        musicXml: '<?xml version="1.0"?><score-partwise version="4.0"><part id="P1"/></score-partwise>',
-        metadata: { durationSec: 15.0, detectedInstruments: ['piano'], tempoBpm: 120, keyName: 'C minor' },
-      }));
-    });
-    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
-    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { server, url, seen } = await startAsyncStub([
+      { status: 'processing' },
+      { status: 'processing' },
+      GOOD_RESULT(midiBytes.toString('base64')),
+    ]);
     try {
       const engine = new RemoteMuScriptorEngine(url);
       expect((await engine.available()).ok).toBe(true);
       const audioPath = await fixtureWav();
       const outDir = path.join(tmpRoot, 'out');
       const result = await engine.transcribe(req(audioPath, outDir), () => {});
+      expect(seen.posts).toBe(1);
+      expect(seen.polls).toBeGreaterThanOrEqual(2);
       expect((await fs.readFile(result.midiPath)).equals(midiBytes)).toBe(true);
       expect(await fs.readFile(result.musicXmlPath, 'utf8')).toContain('<score-partwise');
       expect(result.engineUsed).toBe('remote-muscriptor (small)');
@@ -85,16 +117,14 @@ describe('RemoteMuScriptorEngine', () => {
   });
 
   it('rejects an empty MusicXML shell instead of writing it', async () => {
-    const server = createServer((_req, res) => {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({
+    const { server, url } = await startAsyncStub([{
+      status: 'completed',
+      result: {
         midiBase64: Buffer.from([1, 2, 3]).toString('base64'),
         musicXml: '<?xml version="1.0" encoding="UTF-8"?><score-partwise version="4.0"></score-partwise>',
         metadata: { durationSec: null, detectedInstruments: null },
-      }));
-    });
-    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
-    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      },
+    }]);
     try {
       const engine = new RemoteMuScriptorEngine(url);
       const audioPath = await fixtureWav();
@@ -109,7 +139,64 @@ describe('RemoteMuScriptorEngine', () => {
     }
   });
 
-  it('maps unreachable worker during transcribe to EngineUnavailableError', async () => {
+  it('surfaces a worker-side job failure as TranscriptionError', async () => {
+    const { server, url } = await startAsyncStub([
+      { status: 'processing' },
+      { status: 'error', message: 'boom subprocess died' },
+    ]);
+    try {
+      const engine = new RemoteMuScriptorEngine(url);
+      const audioPath = await fixtureWav();
+      await expect(
+        engine.transcribe(req(audioPath, path.join(tmpRoot, 'out-err')), () => {}),
+      ).rejects.toThrow(/boom subprocess died/);
+    } finally {
+      server.close();
+    }
+  });
+
+  it('maps a lost job (404 on poll) to TranscriptionError, not success', async () => {
+    const server = createServer((nodeReq: IncomingMessage, res: ServerResponse) => {
+      nodeReq.resume();
+      nodeReq.on('end', () => {
+        if (nodeReq.method === 'POST') {
+          res.writeHead(202, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ jobId: 'gone', status: 'processing' }));
+        } else {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ status: 'not_found' }));
+        }
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const engine = new RemoteMuScriptorEngine(url);
+      const audioPath = await fixtureWav();
+      await expect(
+        engine.transcribe(req(audioPath, path.join(tmpRoot, 'out-gone')), () => {}),
+      ).rejects.toBeInstanceOf(TranscriptionError);
+    } finally {
+      server.close();
+    }
+  });
+
+  it('aborts a hung poll as CancelledError when the job is cancelled', async () => {
+    const { server, url } = await startAsyncStub([{ status: 'processing' }]);
+    try {
+      const engine = new RemoteMuScriptorEngine(url);
+      const audioPath = await fixtureWav();
+      const ctl = new AbortController();
+      setTimeout(() => ctl.abort(), 2500).unref();
+      await expect(
+        engine.transcribe(req(audioPath, path.join(tmpRoot, 'out-cancel'), ctl.signal), () => {}),
+      ).rejects.toBeInstanceOf(CancelledError);
+    } finally {
+      server.close();
+    }
+  });
+
+  it('maps unreachable worker during submit to EngineUnavailableError', async () => {
     const engine = new RemoteMuScriptorEngine('http://127.0.0.1:9');
     const audioPath = await fixtureWav();
     await expect(
