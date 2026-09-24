@@ -1,5 +1,6 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
+import './App.css'
 import ScoreViewer, { SCORE_RENDER_ERROR_TEXT, WASM_UNAVAILABLE_TEXT } from './ScoreViewer'
 
 // The engraving engine is the only thing mocked here: these tests drive the
@@ -70,6 +71,18 @@ it('mounts every Verovio page so long scores are never cut short', async () => {
   expect(pages[0]).toHaveAttribute('aria-label', 'Sheet music, page 1')
   expect(pages[24]).toHaveAttribute('aria-label', 'Sheet music, page 25')
   expect(onReady).toHaveBeenCalledTimes(1)
+})
+
+it('keeps symmetric breathing room outside the notation on both horizontal edges', async () => {
+  render(<ScoreViewer xml="<score-partwise version='4.0'/>" onReady={vi.fn()} onRenderFailure={vi.fn()} />)
+  await screen.findByText(/1 page · MusicXML notation/)
+  const scroller = screen.getByLabelText(/Sheet music workspace/)
+  const style = getComputedStyle(scroller)
+  // Gutters live on the scroll container itself (outside the scrollport), so
+  // they frame the first and last page alike without touching page geometry.
+  expect(style.borderLeftWidth).toBe('24px')
+  expect(style.borderRightWidth).toBe('24px')
+  expect(style.borderLeftWidth).toBe(style.borderRightWidth)
 })
 
 it('shows an inline message when Verovio refuses the score, without blaming the backend', async () => {
