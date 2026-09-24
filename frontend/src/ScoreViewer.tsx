@@ -74,6 +74,24 @@ class ScoreRejected extends Error {}
 class WasmUnavailable extends Error {}
 
 /**
+ * Production Verovio engraving options: a wide workspace page (not a
+ * shrunken fit-to-card) with wrapped systems (`breaks: 'auto'` — never a
+ * single endless line), generously sized glyphs, and height fitted to the
+ * content. Pages are deliberately allowed to exceed the viewport: the
+ * surrounding `.score-scroll` container scrolls both axes instead of the
+ * application shrinking the notation to fit.
+ */
+export const NOTATION_RENDER_OPTIONS = {
+  inputFrom: 'musicxml',
+  pageWidth: 2200,
+  pageHeight: 2970,
+  scale: 50,
+  breaks: 'auto',
+  adjustPageHeight: true,
+  footer: 'none',
+} as const
+
+/**
  * The exact DOMPurify configuration applied to Verovio's SVG output.
  *
  * Verovio 6.3.0 engraves every SMuFL glyph (noteheads, clefs, accidentals,
@@ -117,11 +135,20 @@ async function renderScore(xml: string) {
     // renderToTimemap() entries carry onset timing only ({ on/off, qstamp,
     // tstamp, tempo }) — never note ids. Sampling happens solely through
     // buildTimeline below, and only while the feature flag is on.
-    toolkit.setOptions({ inputFrom: 'musicxml', pageWidth: 2100, pageHeight: 2970, scale: 40, adjustPageHeight: true, footer: 'none' })
+    toolkit.setOptions({ ...NOTATION_RENDER_OPTIONS })
     if (!toolkit.loadData(xml) || !toolkit.getPageCount()) throw new ScoreRejected('Verovio rejected the score')
     const pages = Array.from({ length: toolkit.getPageCount() }, (_, i) => sanitizeNotationSVG(toolkit!.renderToSVG(i + 1)))
+    // Natural page width in px, read from the engraved SVG itself so zoom
+    // scales the real notation size (never a hardcoded guess). Falls back to
+    // the theoretical width (pageWidth * scale / 100) when unparseable.
+    let pageWidthPx = (NOTATION_RENDER_OPTIONS.pageWidth * NOTATION_RENDER_OPTIONS.scale) / 100
+    const widthMatch = pages[0]?.match(/<svg[^>]*\swidth="([\d.]+)px"/)
+    if (widthMatch) {
+      const parsed = Number.parseFloat(widthMatch[1])
+      if (Number.isFinite(parsed) && parsed > 0) pageWidthPx = parsed
+    }
     const timeline = ENABLE_NOTE_HIGHLIGHTING ? buildTimeline(toolkit) : []
-    return { pages, timeline }
+    return { pages, timeline, pageWidthPx }
   } finally { toolkit?.destroy() }
 }
 export default function ScoreViewer({ xml, onReady, onRenderFailure, activeNoteId, onNoteHighlight, onTimelineChange }: {
@@ -136,16 +163,21 @@ export default function ScoreViewer({ xml, onReady, onRenderFailure, activeNoteI
   onTimelineChange?: (spans: NoteSpan[]) => void
 }) {
   const [pages, setPages] = useState<string[]>([])
+  const [pageWidthPx, setPageWidthPx] = useState<number | null>(null)
   const [failure, setFailure] = useState<RenderFailureCode | null>(null)
   const [zoom, setZoom] = useState(100)
   const scroll = useRef<HTMLDivElement>(null)
+  // Click/touch-drag panning state. Mouse drags pan via scrollLeft/Top;
+  // touch and wheel/trackpad keep their native scrolling behavior.
+  const pan = useRef<{ x: number; y: number; left: number; top: number } | null>(null)
   useEffect(() => {
     let active = true
-    setPages([]); setFailure(null)
+    setPages([]); setPageWidthPx(null); setFailure(null)
     renderScore(xml)
       .then(result => {
         if (!active) return
         setPages(result.pages)
+        setPageWidthPx(result.pageWidthPx)
         onTimelineChange?.(result.timeline)
         onReady()
       })
@@ -182,11 +214,42 @@ export default function ScoreViewer({ xml, onReady, onRenderFailure, activeNoteI
     for (const note of notes) if (note !== next) note.classList.remove('playing')
     next?.classList.add('playing')
   }, [activeNoteId, pages])
+  // Drag-to-pan handlers (mouse only; touch keeps native scrolling).
+  const onPanStart = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.pointerType !== 'mouse' || event.button !== 0) return
+    const root = scroll.current
+    if (!root) return
+    pan.current = { x: event.clientX, y: event.clientY, left: root.scrollLeft, top: root.scrollTop }
+    root.classList.add('panning')
+    root.setPointerCapture?.(event.pointerId)
+  }
+  const onPanMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const gesture = pan.current
+    const root = scroll.current
+    if (!gesture || !root) return
+    root.scrollLeft = gesture.left - (event.clientX - gesture.x)
+    root.scrollTop = gesture.top - (event.clientY - gesture.y)
+  }
+  const onPanEnd = (event: React.PointerEvent<HTMLDivElement>) => {
+    pan.current = null
+    scroll.current?.classList.remove('panning')
+    try { scroll.current?.releasePointerCapture?.(event.pointerId) } catch { /* already released */ }
+  }
+
   return <>
     <div className="score-tools"><span className={pages.length || failure ? undefined : 'pulse'}>{pages.length ? `${pages.length} ${pages.length === 1 ? 'page' : 'pages'} · MusicXML notation` : failure ? 'Notation unavailable' : 'Engraving your manuscript…'}</span><div className="zoom"><button aria-label="Zoom out" disabled={zoom <= 60} onClick={() => setZoom(z => z - 10)}>−</button><output aria-label="Zoom level">{zoom}%</output><button aria-label="Zoom in" disabled={zoom >= 160} onClick={() => setZoom(z => z + 10)}>+</button></div></div>
-    <div className="score-scroll" ref={scroll} tabIndex={0} aria-label="Sheet music pages">
+    <div
+      className="score-scroll"
+      ref={scroll}
+      tabIndex={0}
+      aria-label="Sheet music workspace. Drag to pan."
+      onPointerDown={onPanStart}
+      onPointerMove={onPanMove}
+      onPointerUp={onPanEnd}
+      onPointerCancel={onPanEnd}
+    >
       {failure && <p className="score-error" role="alert" data-render-failure={failure}>{failure === 'wasm-unavailable' ? WASM_UNAVAILABLE_TEXT : SCORE_RENDER_ERROR_TEXT}</p>}
-      {pages.map((svg, i) => <div className="score-page" key={i} style={{ width: `${840 * zoom / 100}px` }} role="img" aria-label={`Sheet music, page ${i + 1}`} dangerouslySetInnerHTML={{ __html: svg }} />)}
+      {pages.map((svg, i) => <div className="score-page" key={i} style={pageWidthPx ? { width: `${(pageWidthPx * zoom) / 100}px` } : undefined} role="img" aria-label={`Sheet music, page ${i + 1}`} dangerouslySetInnerHTML={{ __html: svg }} />)}
     </div>
   </>
 }

@@ -1379,8 +1379,15 @@ def generate_clean_grand_staff(source_stream, title="Piano Transcription"):
 
     p_upper = _stream_mod.Part(id="P1")
     p_upper.partName = "Right Hand"
+    # Display metadata only (never musical content): Verovio prints the full
+    # part name on the first system and the abbreviation on later ones, so
+    # the abbreviation must match the full name — otherwise systems disagree
+    # ("Right Hand" vs an auto-derived "Pno"). Same part, same name, every
+    # system, on every instrument: the value always mirrors partName.
+    p_upper.partAbbreviation = "Right Hand"
     p_lower = _stream_mod.Part(id="P2")
     p_lower.partName = "Left Hand"
+    p_lower.partAbbreviation = "Left Hand"
     for part in (p_upper, p_lower):
         try:
             part.insert(0, _instrument_mod.Piano())
@@ -1389,7 +1396,10 @@ def generate_clean_grand_staff(source_stream, title="Piano Transcription"):
 
     try:
         score.append(
-            _layout_mod.StaffGroup([p_upper, p_lower], name="Piano", symbol="brace", barTogether=True)
+            _layout_mod.StaffGroup(
+                [p_upper, p_lower], name="Piano", abbreviation="Piano",
+                symbol="brace", barTogether=True,
+            )
         )
     except Exception:
         try:
@@ -1590,6 +1600,9 @@ def build_lead_sheet(score):
 
     part = stream.Part()
     part.partName = "Lead Sheet"
+    # Same display-metadata rule as the grand staff: abbreviation mirrors the
+    # full name so every system labels this part identically.
+    part.partAbbreviation = "Lead Sheet"
     part.insert(0, instrument.Piano())
 
     # Melody: the highest sounding pitch at each onset. The top line is the

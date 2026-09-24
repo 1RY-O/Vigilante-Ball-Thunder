@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
 import ScoreViewer, { SCORE_RENDER_ERROR_TEXT, WASM_UNAVAILABLE_TEXT } from './ScoreViewer'
 
@@ -30,6 +30,33 @@ it('engraves a valid score and reports readiness', async () => {
   expect(onReady).toHaveBeenCalledTimes(1)
   expect(onRenderFailure).not.toHaveBeenCalled()
   expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+})
+
+it('sizes pages to the natural engraved width and scales them with zoom', async () => {
+  const onReady = vi.fn()
+  render(<ScoreViewer xml="<score-partwise version='4.0'/>" onReady={onReady} onRenderFailure={vi.fn()} />)
+  await screen.findByText(/1 page · MusicXML notation/)
+  // Mock SVG carries no width attribute, so the viewer falls back to the
+  // theoretical width (pageWidth * scale / 100 = 2200 * 50 / 100).
+  const page = screen.getByRole('img', { name: 'Sheet music, page 1' })
+  expect(page.style.width).toBe('1100px')
+  await fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }))
+  expect(screen.getByRole('img', { name: 'Sheet music, page 1' }).style.width).toBe('1210px')
+  expect(screen.getByLabelText('Zoom level')).toHaveTextContent('110%')
+})
+
+it('pans the workspace with a mouse drag without breaking the page', async () => {
+  render(<ScoreViewer xml="<score-partwise version='4.0'/>" onReady={vi.fn()} onRenderFailure={vi.fn()} />)
+  await screen.findByText(/1 page · MusicXML notation/)
+  const scroller = screen.getByLabelText(/Sheet music workspace/)
+  scroller.scrollLeft = 0
+  fireEvent.pointerDown(scroller, { pointerType: 'mouse', button: 0, clientX: 200, clientY: 100 })
+  fireEvent.pointerMove(scroller, { pointerType: 'mouse', clientX: 120, clientY: 100 })
+  expect(scroller.scrollLeft).toBe(80)
+  fireEvent.pointerUp(scroller)
+  expect(scroller).not.toHaveClass('panning')
+  // The notation itself is untouched by panning.
+  expect(screen.getByRole('img', { name: 'Sheet music, page 1' })).toBeInTheDocument()
 })
 
 it('shows an inline message when Verovio refuses the score, without blaming the backend', async () => {

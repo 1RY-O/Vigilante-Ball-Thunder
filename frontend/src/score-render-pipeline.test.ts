@@ -1,7 +1,7 @@
 import { expect, it } from 'vitest'
 import createModule from 'verovio/wasm'
 import { VerovioToolkit } from 'verovio/esm'
-import { sanitizeNotationSVG } from './ScoreViewer'
+import { NOTATION_RENDER_OPTIONS, sanitizeNotationSVG } from './ScoreViewer'
 import minimalXml from '../e2e/fixtures/minimal-grand.musicxml?raw'
 import realXml from '../e2e/fixtures/grand-staff.real.musicxml?raw'
 
@@ -31,7 +31,7 @@ for (const [name, xml] of CASES) {
     // 2. Real Verovio engraves it through the production options.
     const toolkit = new VerovioToolkit(await createModule())
     try {
-      toolkit.setOptions({ inputFrom: 'musicxml', pageWidth: 2100, pageHeight: 2970, scale: 40, adjustPageHeight: true, footer: 'none' })
+      toolkit.setOptions({ ...NOTATION_RENDER_OPTIONS })
       expect(toolkit.loadData(xml)).toBeTruthy()
       expect(toolkit.getPageCount()).toBeGreaterThan(0)
       const raw = toolkit.renderToSVG(1)
@@ -52,8 +52,22 @@ for (const [name, xml] of CASES) {
   }, 60000)
 }
 
-it('sanitization still neutralizes hostile markup (not disabled)', () => {
-  const clean = sanitizeNotationSVG(
+it('backend grand staff uses identical full/abbreviated labels on every system', () => {
+  // Verovio prints part-name on the first system and part-abbreviation
+  // (group-name / group-abbreviation for the brace group) on later ones.
+  // Any mismatch renders as "Piano / Right Hand / Left Hand" up top and
+  // "Pno / Pno" below, so the artifact must carry matching pairs.
+  const names = [...realXml.matchAll(/<part-name>([^<]*)<\/part-name>/g)].map(m => m[1])
+  const abbrs = [...realXml.matchAll(/<part-abbreviation>([^<]*)<\/part-abbreviation>/g)].map(m => m[1])
+  expect(names.length).toBeGreaterThan(0)
+  expect(abbrs).toEqual(names)
+  const groupName = realXml.match(/<group-name>([^<]*)<\/group-name>/)?.[1]
+  const groupAbbr = realXml.match(/<group-abbreviation>([^<]*)<\/group-abbreviation>/)?.[1]
+  expect(groupName).toBeTruthy()
+  expect(groupAbbr).toBe(groupName)
+})
+
+it('sanitization still neutralizes hostile markup (not disabled)', () => {  const clean = sanitizeNotationSVG(
     '<svg><use href="javascript:alert(1)"/><script>alert(1)</script>' +
     '<g class="notehead" onclick="evil()"><use xlink:href="#a"/></g></svg>',
   )
